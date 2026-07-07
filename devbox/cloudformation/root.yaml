@@ -596,6 +596,15 @@ Outputs:
     Description: ECR repository URI (Prod mode; for docker push from build pipelines).
     Value: !GetAtt CommonData.Outputs.EcrRepositoryUri
 
+  ImageRegistryConfig:
+    Condition: IsProd
+    Description: >-
+      One-shot CLI config so SDK image builds push to this stack's ECR (all
+      `flyte run`/deploy builds then target it automatically). The --registry flag
+      requires a flyte SDK that includes flyteorg/flyte-sdk#1278; until then set
+      registry=<ProdEcrUri host>, name=<repo> on the Image in code.
+    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type pkce --registry ${CommonData.Outputs.EcrRepositoryUri}"
+
   # ---- Always-on outputs --------------------------------------------------
   InstanceId:
     Description: EC2 instance ID.
