@@ -139,6 +139,49 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
         - ALLOW_USER_SRP_AUTH
 
+  # ---- Hosted-UI branding (logo + colour scheme) ----
+  # CloudFormation's native UICustomizationAttachment only does CSS, not the logo
+  # image, so a tiny custom resource calls SetUICustomization for both. The assets
+  # (login-ui.css + login-logo.png) are bundled beside the handler and uploaded by
+  # `aws cloudformation package`. This lives in the shared auth stack so every
+  # product's login page is branded identically.
+  BrandingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: set-ui-customization
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:SetUICustomization
+                Resource: !GetAtt UserPool.Arn
+
+  BrandingFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt BrandingRole.Arn
+      Code: branding
+
+  # Applying UI customization needs the hosted-UI domain to exist first.
+  LoginBranding:
+    Type: Custom::CognitoLoginBranding
+    DependsOn: UserPoolDomain
+    Properties:
+      ServiceToken: !GetAtt BrandingFn.Arn
+      UserPoolId: !Ref UserPool
+
   # Machine-to-machine client for CI (client-credentials). Optional.
   UserPoolClientM2M:
     Type: AWS::Cognito::UserPoolClient

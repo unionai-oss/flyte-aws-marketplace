@@ -42,8 +42,6 @@ install -m 0755 /tmp/files/render-override.sh  /usr/local/bin/flyte-render-overr
 install -m 0755 /tmp/files/render-appdomain.sh /usr/local/bin/flyte-render-appdomain.sh
 install -m 0755 /tmp/files/gpu-setup.sh        /opt/flyte-devbox/gpu-setup.sh
 install -m 0755 /tmp/files/idle-agent.py       /opt/flyte-idle-agent/flyte_idle_agent.py
-install -m 0644 /tmp/files/login-logo.png      /opt/flyte-devbox/login-logo.png
-install -m 0644 /tmp/files/login-ui.css        /opt/flyte-devbox/login-ui.css
 # k3s auto-deploy manifest that turns on traefik access logging (idle signal).
 install -m 0644 /tmp/files/traefik-accesslog.yaml /opt/flyte-devbox/traefik-accesslog.yaml
 

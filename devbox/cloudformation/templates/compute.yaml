@@ -312,15 +312,6 @@ Resources:
                 # AuthMetadataService (runs.authMetadata) for CLI discovery.
                 if [ "${ProdMode}" = "1" ]; then
                   systemctl enable --now flyte-appdomain.service
-                  # Brand the Cognito hosted-UI login page with the Flyte logo +
-                  # CSS (assets baked into the AMI). Idempotent + best-effort.
-                  aws cognito-idp set-ui-customization \
-                    --user-pool-id "${CognitoPoolId}" \
-                    --css "$(cat /opt/flyte-devbox/login-ui.css)" \
-                    --image-file "fileb:///opt/flyte-devbox/login-logo.png" \
-                    --region "$AWS_REGION" >/dev/null 2>&1 \
-                    && echo "cognito hosted-UI branded" \
-                    || echo "cognito UI customization failed (continuing)"
                 fi
 
                 systemctl enable --now flyte-idle-agent.service

@@ -464,10 +464,9 @@ Resources:
               - !GetAtt CommonData.Outputs.DBSecretArn
           - Effect: Allow
             Action:
-              # DescribeUserPoolClient: fetch the confidential client secret at boot.
-              # SetUICustomization: brand the Hosted UI login page with the logo.
+              # Fetch the confidential (console) client secret at boot. Hosted-UI
+              # branding is applied by the shared auth stack, not the box.
               - cognito-idp:DescribeUserPoolClient
-              - cognito-idp:SetUICustomization
             Resource: !GetAtt CommonAuth.Outputs.UserPoolArn
 
   # -------------------------------------------------------------------------
