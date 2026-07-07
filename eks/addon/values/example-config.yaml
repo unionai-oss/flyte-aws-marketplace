@@ -1,0 +1,29 @@
+# Example per-deployment config (what render-config.sh emits and what both
+# install paths consume). Illustrative values — CloudFormation produces the real
+# one from stack outputs. Regenerate with:
+#
+#   DB_HOST=flyte.cluster-xxxx.us-east-1.rds.amazonaws.com \
+#   S3_BUCKET=flyte-abc123 AWS_REGION=us-east-1 \
+#   INGRESS_HOST=flyte.example.com \
+#     scripts/render-config.sh > my-config.yaml
+flyte-binary:
+  flyte-core-components:
+    runs:
+      storagePrefix: "s3://flyte-example-bucket"
+  configuration:
+    database:
+      postgres:
+        host: "flyte.cluster-abcdef.us-east-1.rds.amazonaws.com"
+        port: 5432
+        dbname: "flyte"
+        username: "flyte"
+        passwordPath: "/etc/db/secret/password"
+    storage:
+      metadataContainer: "flyte-example-bucket"
+      providerConfig:
+        s3:
+          region: "us-east-1"
+          authType: iam
+  ingress:
+    create: true
+    host: "flyte.example.com"

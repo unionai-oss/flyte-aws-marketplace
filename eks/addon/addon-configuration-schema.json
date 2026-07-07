@@ -1,0 +1,106 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "flyte-eks add-on configuration",
+  "description": "Per-deployment configuration merged into the flyte-eks wrapper chart. CloudFormation (Artifact B) supplies these values via AWS::EKS::Addon ConfigurationValues; the helm-fallback path receives the identical document from scripts/render-config.sh. All keys are namespaced under `flyte-binary` because that subchart is what receives the values.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "flyte-binary": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "flyte-core-components": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "runs": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "storagePrefix": {
+                  "type": "string",
+                  "description": "Data offload prefix for the unified Flyte manager, e.g. s3://<provisioned-bucket>."
+                }
+              }
+            }
+          }
+        },
+        "configuration": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "database": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "flyte-binary v2 reads the connection from database.postgres.* (the flat database.* keys are v1 and ignored).",
+              "properties": {
+                "postgres": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "host": {
+                      "type": "string",
+                      "description": "Aurora Serverless v2 (PostgreSQL) writer endpoint."
+                    },
+                    "port": { "type": "integer", "default": 5432 },
+                    "dbname": { "type": "string", "default": "flyte" },
+                    "username": { "type": "string", "default": "flyte" },
+                    "passwordPath": {
+                      "type": "string",
+                      "default": "/etc/db/secret/password",
+                      "description": "File path where the DB password is mounted from the flyte-db-credentials Secret. Never pass the password inline."
+                    },
+                    "options": { "type": "string", "default": "sslmode=require" }
+                  }
+                }
+              }
+            },
+            "storage": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "metadataContainer": {
+                  "type": "string",
+                  "description": "S3 bucket for Flyte metadata (the provisioned bucket). v2 has no separate userDataContainer."
+                },
+                "providerConfig": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "s3": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "properties": {
+                        "region": {
+                          "type": "string",
+                          "description": "AWS region of the S3 bucket, e.g. us-east-1."
+                        },
+                        "authType": {
+                          "type": "string",
+                          "enum": ["iam"],
+                          "default": "iam",
+                          "description": "Fixed to iam — credentials come from the EKS Pod Identity role. Static keys are rejected."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "create": { "type": "boolean", "default": false },
+            "host": {
+              "type": "string",
+              "description": "Public hostname, e.g. flyte.example.com (prod mode only)."
+            }
+          }
+        }
+      }
+    }
+  }
+}

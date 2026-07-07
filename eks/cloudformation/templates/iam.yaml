@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flyte 2 on EKS — IAM layer. The S3 access role for the Flyte backend, bound to
+  its Kubernetes service account via EKS Pod Identity (no static keys, no IRSA
+  OIDC provider). The AWS Load Balancer Controller's IAM is created by the
+  bootstrap (see flyte.yaml) since it is installed in-cluster.
+
+Parameters:
+  ClusterName:
+    Type: String
+  BucketArn:
+    Type: String
+  Namespace:
+    Type: String
+    Default: flyte
+  ServiceAccountName:
+    Type: String
+    Default: flyte-backend
+  TaskServiceAccountName:
+    Type: String
+    Default: flyte-task
+    Description: SA that task pods run under (executor.defaultK8sServiceAccount). Created by bootstrap.sh.
+
+Resources:
+  FlyteS3Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-flyte-s3"
+      # EKS Pod Identity trust: the pods.eks.amazonaws.com principal assumes this
+      # role for the associated (namespace, serviceAccount) below.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      Policies:
+        - PolicyName: flyte-s3-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ObjectAccess
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub "${BucketArn}/*"
+              - Sid: BucketAccess
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                Resource: !Ref BucketArn
+
+  FlytePodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Ref Namespace
+      ServiceAccount: !Ref ServiceAccountName
+      RoleArn: !GetAtt FlyteS3Role.Arn
+
+  # Task pods run as a dedicated SA (not the backend SA, which carries cluster
+  # RBAC). It shares the S3-only role — tasks need exactly the same bucket
+  # access and nothing more. The SA itself is created in-cluster by bootstrap.sh.
+  FlyteTaskPodIdentity:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ClusterName
+      Namespace: !Ref Namespace
+      ServiceAccount: !Ref TaskServiceAccountName
+      RoleArn: !GetAtt FlyteS3Role.Arn
+
+Outputs:
+  FlyteS3RoleArn:
+    Value: !GetAtt FlyteS3Role.Arn

@@ -1,0 +1,44 @@
+# Build -> smoke -> publish, uploaded dynamically by check-and-build.sh only when
+# a new devbox release is detected. Publishing = writing the AMI id to SSM so
+# deploys pick it up with no template change / no PR. Paths are monorepo-relative
+# (the devbox lives under devbox/).
+steps:
+  - label: ":packer: build AMI"
+    key: build-ami
+    command: |
+      cd devbox/packer
+      packer init .
+      # The build instance needs a public subnet (account-specific) — discover one.
+      SUBNET=$(aws ec2 describe-subnets --filters Name=map-public-ip-on-launch,Values=true --query 'Subnets[0].SubnetId' --output text)
+      VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+      packer build -var subnet_id="$SUBNET" -var vpc_id="$VPC" -machine-readable . | tee /tmp/packer.log
+      AMI_ID=$(grep 'artifact,0,id' /tmp/packer.log | cut -d, -f6 | cut -d: -f2)
+      echo "built AMI: $AMI_ID"
+      buildkite-agent meta-data set "ami_id" "$AMI_ID"
+    agents:
+      queue: "aws"
+
+  - label: ":aws: integration smoke (deploy -> flyte run -> teardown)"
+    key: smoke
+    depends_on: build-ami
+    command: |
+      AMI_ID=$(buildkite-agent meta-data get "ami_id")
+      AMI_ID="$AMI_ID" ./devbox/scripts/smoke-test.sh
+    agents:
+      queue: "aws"
+
+  # Only reached if the smoke test passed — never publish an unvalidated AMI.
+  - label: ":rocket: publish AMI to SSM"
+    key: publish
+    depends_on: smoke
+    command: |
+      AMI_ID=$(buildkite-agent meta-data get "ami_id")
+      DIGEST=$(buildkite-agent meta-data get "source_digest")
+      echo "publishing AMI $AMI_ID (built from devbox digest $DIGEST)"
+      aws ssm put-parameter --name /flyte-devbox/ami/latest \
+        --type String --data-type aws:ec2:image --value "$AMI_ID" --overwrite
+      aws ssm put-parameter --name /flyte-devbox/ami/source-digest \
+        --type String --value "$DIGEST" --overwrite
+      echo "published — new deploys (and 'update-stack' with AmiId='') now use $AMI_ID"
+    agents:
+      queue: "aws"

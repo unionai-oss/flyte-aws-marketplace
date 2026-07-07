@@ -1,0 +1,16 @@
+[Unit]
+Description=Set Knative app-serving domain to apps.<Domain> (Prod)
+After=flyte-devbox.service
+Requires=flyte-devbox.service
+# Re-run on every flyte-devbox (re)start, not just at boot: the k3s addon
+# reseeds config-domain to 'localhost' each time the cluster comes up, so the
+# app URLs break unless this re-applies after a container restart/wake.
+PartOf=flyte-devbox.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/flyte-render-appdomain.sh
+
+[Install]
+WantedBy=multi-user.target

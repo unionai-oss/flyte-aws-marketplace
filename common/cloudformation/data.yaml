@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flyte 2 shared data substrate. S3 object store, Aurora Serverless v2 PostgreSQL
+  (scale-to-zero capable), and a generated DB password in Secrets Manager. Nested
+  by both the devbox and EKS products; every value that differs between them is a
+  Parameter passed by the product's root.yaml — no product-specific conditionals
+  live in this file.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: >-
+      Prefix for the bucket and resource names. The devbox passes
+      "<stack>-flyte"; EKS passes "flyte-<cluster>". The bucket is named
+      "<NamePrefix>-<AccountId>-<Region>".
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for the Aurora DB subnet group (>=2 AZs).
+  ClientSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: >-
+      Security group allowed to reach Aurora on 5432. The devbox passes its EC2
+      instance SG; EKS passes its cluster SG.
+  DBName:
+    Type: String
+    Default: flyte
+  DBUsername:
+    Type: String
+    Default: flyte
+  DBSecretName:
+    Type: String
+    Description: Secrets Manager name for the generated master credentials.
+  DBMinCapacity:
+    Type: Number
+    Default: 0
+    Description: Aurora Serverless v2 min ACU. 0 enables scale-to-zero.
+  DBMaxCapacity:
+    Type: Number
+    Default: 16
+  EngineVersion:
+    Type: String
+    Default: "17.9"
+    Description: Aurora PostgreSQL version (must support Serverless v2 scale-to-zero).
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 1
+    Description: Automated backup retention in days.
+  EcrRepositoryName:
+    Type: String
+    Description: >-
+      Name of the ECR repository for Flyte task images. Retained on stack delete
+      (like the S3 bucket), so pick a per-deployment-unique name.
+
+Resources:
+  # ---- S3 object store (superset of both products' features) ----
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${NamePrefix}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-mpu
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # ---- ECR repository for Flyte task images ----
+  # Developers push task images here; the compute layer pulls them. Retained on
+  # stack delete (matching the S3 bucket) so images survive a teardown/redeploy.
+  TaskImageRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Ref EcrRepositoryName
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+
+  # ---- DB password (generated, never surfaced in a parameter) ----
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Ref DBSecretName
+      Description: Flyte Aurora PostgreSQL master credentials.
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # ---- Aurora Serverless v2 (PostgreSQL) ----
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${NamePrefix} Flyte Aurora subnets"
+      SubnetIds: !Ref SubnetIds
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${NamePrefix} Flyte Aurora access"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ClientSecurityGroupId
+          Description: PostgreSQL from the Flyte compute layer
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-aurora-sg"
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref EngineVersion
+      DatabaseName: !Ref DBName
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}:SecretString:password}}"
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      StorageEncrypted: true
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      ServerlessV2ScalingConfiguration:
+        # MinCapacity 0 = scale-to-zero: the cluster auto-pauses after ~5 min idle
+        # (no ACU billing) and resumes in ~15s on the next query.
+        MinCapacity: !Ref DBMinCapacity
+        MaxCapacity: !Ref DBMaxCapacity
+      EnableCloudwatchLogsExports:
+        - postgresql
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  BucketArn:
+    Value: !GetAtt DataBucket.Arn
+  DBSecretArn:
+    Value: !Ref DBSecret
+  DBEndpoint:
+    Value: !GetAtt DBCluster.Endpoint.Address
+  DBPort:
+    Value: !GetAtt DBCluster.Endpoint.Port
+  DBName:
+    Value: !Ref DBName
+  DBUsername:
+    Value: !Ref DBUsername
+  EcrRepositoryUri:
+    Description: ECR repository for Flyte task images (push target for the SDK image builder).
+    Value: !GetAtt TaskImageRepository.RepositoryUri

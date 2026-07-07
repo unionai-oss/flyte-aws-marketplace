@@ -1,0 +1,46 @@
+# k3s HelmChartConfig override for the bundled traefik ingress.
+#
+# IMPORTANT: k3s allows only ONE HelmChartConfig per chart, and the devbox image
+# ships its own `HelmChartConfig/traefik`. A same-named file REPLACES it, so this
+# file must MIRROR the image's traefik values (NodePort 30080, and the
+# `forwardedHeaders.insecure` trust that lets the ALB's `X-Forwarded-Proto: https`
+# reach flyte-binary — without it the data-plane upload URL comes back as
+# http://…:80 and the SDK hangs) and ADD access logging on top.
+#
+# Access logging is the idle-agent's "authenticated activity" signal: because auth
+# is enforced at the ALB, every non-health request reaching traefik is already
+# authenticated, so a recent non-/healthz access line means the box is in use.
+# The agent reads these via `docker exec flyte-devbox kubectl logs`.
+#
+# If a future devbox image changes its traefik values, re-mirror them here.
+# Mounted by the devbox `docker run` into /var/lib/rancher/k3s/server/manifests/.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    service:
+      type: NodePort
+    ports:
+      web:
+        nodePort: 30080
+        # ALB terminates TLS and forwards plaintext to this entrypoint. Trust its
+        # X-Forwarded-Proto: https instead of letting Traefik rewrite it to http.
+        forwardedHeaders:
+          insecure: true
+        transport:
+          respondingTimeouts:
+            readTimeout: 0
+      websecure:
+        expose: false
+    providers:
+      kubernetesCRD:
+        allowExternalNameServices: true
+      kubernetesIngress:
+        allowExternalNameServices: true
+    logs:
+      access:
+        enabled: true
+        format: json

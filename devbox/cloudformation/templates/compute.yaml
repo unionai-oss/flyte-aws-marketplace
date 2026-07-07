@@ -1,0 +1,1039 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flyte devbox compute layer: the single EC2 host (via launch template), the
+  auto-stop wake/stop lambdas, and — in Prod mode — the ALB front door that
+  enforces Cognito auth at the edge (jwt-validation + authenticate-cognito
+  listener rules) and the Route 53 records. All backend wiring (S3/Aurora/Cognito)
+  arrives pre-resolved as parameters from root.yaml, which reads the shared
+  common/{data,auth} stacks — this template never references them directly.
+
+Parameters:
+  # ---- mode / behaviour ----
+  Domain:
+    Type: String
+    Default: ""
+    Description: Empty = Eval mode; set = Prod mode (ALB + ACM + Route 53).
+  InstanceType:
+    Type: String
+    Default: m6i.2xlarge
+  IdleThresholdMinutes:
+    Type: Number
+    Default: 30
+  DevboxImage:
+    Type: String
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    Description: Resolved devbox AMI id (root resolves AmiId / AmiSsmParameter).
+  NoPublicIngress:
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes", "No"]
+  StableIp:
+    Type: String
+    Default: "Yes"
+    AllowedValues: ["Yes", "No"]
+  AutoStop:
+    Type: String
+    Default: "Yes"
+    AllowedValues: ["Yes", "No"]
+  # ---- infra handles from root ----
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnetBId:
+    Type: String
+    Default: ""
+    Description: Second public subnet for the ALB (Prod mode only).
+  InstanceSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  AlbSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: ALB security group id (Prod mode only).
+  InstanceProfileArn:
+    Type: String
+  DataVolumeId:
+    Type: String
+  # ---- backend wiring (pre-resolved by root; "none"/defaults in Eval mode) ----
+  ProdMode:
+    Type: String
+    Default: "0"
+  BucketName:
+    Type: String
+    Default: "none"
+  DbHost:
+    Type: String
+    Default: "none"
+  DbPort:
+    Type: String
+    Default: "5432"
+  DbSecretArn:
+    Type: String
+    Default: "none"
+  FlyteDomain:
+    Type: String
+    Default: "none"
+  CognitoIssuer:
+    Type: String
+    Default: "none"
+  CognitoPkceClientId:
+    Type: String
+    Default: "none"
+  CognitoDomain:
+    Type: String
+    Default: "none"
+    Description: Cognito hosted-UI domain (<prefix>.auth.<region>.amazoncognito.com).
+  CognitoWebClientId:
+    Type: String
+    Default: "none"
+  CognitoPoolId:
+    Type: String
+    Default: "none"
+  CognitoUserPoolArn:
+    Type: String
+    Default: "none"
+  CognitoDomainPrefix:
+    Type: String
+    Default: "none"
+
+Conditions:
+  IsProd: !Not [!Equals [!Ref Domain, ""]]
+  WantsEip: !And
+    - !Equals [!Ref Domain, ""]
+    - !Equals [!Ref NoPublicIngress, "No"]
+    - !Equals [!Ref StableIp, "Yes"]
+  WantsAutoStop: !Equals [!Ref AutoStop, "Yes"]
+  WantsProdWake: !And
+    - !Not [!Equals [!Ref Domain, ""]]
+    - !Equals [!Ref AutoStop, "Yes"]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # EC2. HopLimit=3 so containers reach IMDS for the instance role creds.
+  # -------------------------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref ImageId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !Ref InstanceProfileArn}
+        MetadataOptions:
+          # HttpTokens=optional (IMDSv1+v2): Flyte's stow S3 library (AWS SDK Go v1)
+          # only speaks IMDSv1; with IMDSv2-required the SDK silently fails to
+          # resolve EC2 instance-role credentials and dataproxy can't presign URLs.
+          # Risk is SSRF-via-IMDS from user pods, but those pods already have
+          # the instance role attached via IMDS by design.
+          # HopLimit=3: hop chain from a k3s pod is host -> docker0 -> k3s -> pod.
+          HttpTokens: optional
+          HttpPutResponseHopLimit: 3
+          HttpEndpoint: enabled
+        SecurityGroupIds: [!Ref InstanceSecurityGroupId]
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: 30
+              VolumeType: gp3
+              DeleteOnTermination: true
+              Encrypted: true
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash
+                set -euo pipefail
+                exec > >(tee -a /var/log/flyte-devbox-init.log) 2>&1
+                echo "[$(date -u +%FT%TZ)] flyte-devbox init starting"
+
+                AWS_REGION="${AwsRegion}"
+                DEVBOX_IMAGE="${DevboxImage}"
+                DATA_DEVICE="${DataDevice}"
+                DATA_VOLUME_ID="${DataVolumeId}"
+
+                # Docker, AWS CLI v2, the idle-agent venv, the product scripts +
+                # static systemd units, and the devbox image are all baked
+                # into the AMI (see packer/). This user-data only does per-instance
+                # wiring: attach the data volume, write config, start services.
+
+                IMDS_TOKEN=$(curl -s -X PUT 'http://169.254.169.254/latest/api/token' -H 'X-aws-ec2-metadata-token-ttl-seconds: 300')
+                INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+                # Self-attach the data volume by ID (no CFN attachment -> instance is
+                # freely replaceable). It holds the durable Flyte storage; Docker's
+                # image root stays on the AMI root volume (baked images). Best-effort;
+                # prod state is external (Aurora/S3).
+                mkdir -p /var/lib/flyte-data
+                for i in $(seq 1 60); do
+                  owner=$(aws ec2 describe-volumes --volume-ids "$DATA_VOLUME_ID" --region "$AWS_REGION" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null || echo "")
+                  [ "$owner" = "$INSTANCE_ID" ] && break
+                  aws ec2 attach-volume --volume-id "$DATA_VOLUME_ID" --instance-id "$INSTANCE_ID" --device /dev/sdf --region "$AWS_REGION" >/dev/null 2>&1 && break
+                  sleep 5
+                done
+                for i in $(seq 1 30); do [ -e "$DATA_DEVICE" ] && break; sleep 2; done
+                if [ -e "$DATA_DEVICE" ]; then
+                  blkid "$DATA_DEVICE" >/dev/null 2>&1 || mkfs.ext4 -L flyte-data "$DATA_DEVICE"
+                  grep -q flyte-data /etc/fstab || echo "LABEL=flyte-data /var/lib/flyte-data ext4 defaults,nofail 0 2" >> /etc/fstab
+                  mount -a || true
+                else
+                  echo "data volume not attached; using root volume for /var/lib/flyte-data"
+                fi
+                mkdir -p /var/lib/flyte-data/storage
+
+                # GPU: if an NVIDIA device is present (PCI vendor 0x10de), install the
+                # driver + toolkit (baked script), use the gpu image, pass --gpus all.
+                # Pure hardware detection (no instance-type list); dormant on CPU.
+                GPU_FLAG=""
+                if grep -qil 10de /sys/bus/pci/devices/*/vendor 2>/dev/null; then
+                  echo "NVIDIA GPU detected; enabling GPU mode"
+                  bash /opt/flyte-devbox/gpu-setup.sh || echo "gpu setup reported errors (continuing)"
+                  GPU_FLAG="--gpus all"
+                  DEVBOX_IMAGE=$(echo "$DEVBOX_IMAGE" | sed 's/:latest$/:gpu-latest/')
+                fi
+
+                # Storage backends. Eval/Private mode: chart defaults — rustfs for
+                # object storage, embedded postgres for the runs DB, in-cluster
+                # docker-registry for images, all on the EBS data volume
+                # (/var/lib/docker), snapshotted nightly by AWS Backup.
+                # Prod mode (Domain set): the render script below writes a config
+                # override that points Flyte at the external S3 bucket + Aurora
+                # Serverless v2 cluster + ECR this stack provisions (auto-wired at
+                # boot — the override handles Viper merge semantics, the k3s addon
+                # reconciler, and the SDK's IMDS credential fallback).
+                mkdir -p /etc/flyte-devbox
+                : > /etc/flyte-devbox/config.yaml
+
+                # Prod-mode wiring parameters (DB_* / BUCKET_* are "none" outside
+                # Prod). The render script below uses these to point Flyte at the
+                # external S3 bucket + Aurora cluster in Prod mode.
+                cat > /etc/flyte-devbox/render.env <<EOF
+                PROD_MODE=${ProdMode}
+                BUCKET_NAME=${BucketName}
+                DB_HOST=${DbHost}
+                DB_PORT=${DbPort}
+                DB_NAME=flyte
+                DB_USER=flyte
+                DB_SECRET_ARN=${DbSecretArn}
+                COGNITO_ISSUER=${CognitoIssuer}
+                COGNITO_PKCE_CLIENT_ID=${CognitoPkceClientId}
+                COGNITO_DOMAIN=${CognitoDomain}
+                COGNITO_WEB_CLIENT_ID=${CognitoWebClientId}
+                COGNITO_POOL_ID=${CognitoPoolId}
+                RENDER_REGION=${AwsRegion}
+                FLYTE_DOMAIN=${FlyteDomain}
+                EOF
+                chmod 0600 /etc/flyte-devbox/render.env
+
+                # Helper: render /var/lib/flyte/config/config.yaml (the devbox's
+                # 999-extra-config override, loaded last so it wins) on every boot.
+                #   - Prod mode: full external-backend override — S3 for the object
+                #     store (replaces in-cluster rustfs) and Aurora for the runs DB
+                #     (replaces embedded postgres). Embedded postgres + rustfs still
+                #     run (the flyte-binary wait-for-db initContainer probes
+                #     postgresql.flyte) but are unused.
+                #   - Eval mode: just point signedURL at the EC2 public hostname so
+                #     remote `flyte run` uploads bundles to the rustfs NodePort.
+                # flyte-render-override.sh + the flyte-idle-agent / flyte-appdomain
+                # units are baked into the AMI; the devbox unit runs the override
+                # renderer as ExecStartPre. Auth is enforced at the ALB (Cognito
+                # jwt-validation / authenticate-cognito listener rules), so there is
+                # no on-box auth proxy or discovery sidecar to start.
+
+                cat > /etc/systemd/system/flyte-devbox.service <<UNIT_EOF
+                [Unit]
+                Description=Flyte devbox k3s cluster
+                After=docker.service network-online.target
+                Wants=docker.service network-online.target
+
+                [Service]
+                Type=simple
+                Restart=on-failure
+                RestartSec=10
+                ExecStartPre=-/usr/bin/docker rm -f flyte-devbox
+                ExecStartPre=/usr/local/bin/flyte-render-override.sh
+                # Reset idle counter on every devbox (re)start so a fresh start
+                # doesn't immediately trip the auto-stop alarm. We mirror the
+                # same line in the idle-agent service for the EC2-boot case.
+                ExecStartPre=-/bin/rm -f /var/lib/flyte-idle-agent/state
+                ExecStart=/usr/bin/docker run --rm --name flyte-devbox --hostname flyte-devbox \\
+                  --privileged \\
+                  --add-host host.docker.internal:host-gateway \\
+                  --env K3S_KUBECONFIG_OUTPUT=/.kube/kubeconfig \\
+                  --volume /var/lib/flyte-devbox-kube:/.kube \\
+                  --volume /etc/flyte-devbox:/var/lib/flyte/config \\
+                  --volume /var/lib/flyte-data/storage:/var/lib/flyte/storage \\
+                  --volume /opt/ecr-cred:/opt/ecr-cred:ro \\
+                  --volume /opt/flyte-devbox/k3s-config.yaml:/etc/rancher/k3s/config.yaml:ro \\
+                  --volume /opt/flyte-devbox/traefik-accesslog.yaml:/var/lib/rancher/k3s/server/manifests/zzz-traefik-accesslog.yaml:ro \\
+                  --volume flyte-k3s-data:/var/lib/rancher/k3s \\
+                  --publish 80:30080 \\
+                  --publish 5000:30000 \\
+                  --publish 30001:30001 \\
+                  --publish 30002:30002 \\
+                  --publish 30003:30003 \\
+                  --publish 8081:30081 \\
+                  --publish 6443:6443 \\
+                  $GPU_FLAG \\
+                  $DEVBOX_IMAGE
+                ExecStop=/usr/bin/docker stop -t 30 flyte-devbox
+
+                [Install]
+                WantedBy=multi-user.target
+                UNIT_EOF
+
+                mkdir -p /var/lib/flyte-devbox-kube /etc/flyte-idle-agent /var/lib/flyte-idle-agent
+
+                # Idle-agent env (the agent script + its venv + systemd unit are baked).
+                cat > /etc/flyte-idle-agent/env <<EOF
+                AWS_REGION=$AWS_REGION
+                INSTANCE_ID=$INSTANCE_ID
+                METRIC_NAMESPACE=FlyteDevbox
+                POLL_INTERVAL_SECONDS=60
+                FLYTE_ENDPOINT=localhost:80
+                EOF
+                chmod 0600 /etc/flyte-idle-agent/env
+
+                systemctl daemon-reload
+                systemctl enable flyte-devbox.service
+                systemctl start flyte-devbox.service
+
+                for i in $(seq 1 60); do
+                  if curl -fsS http://localhost:80/healthz >/dev/null 2>&1; then
+                    echo "[$(date -u +%FT%TZ)] devbox ready after $i polls"
+                    break
+                  fi
+                  sleep 5
+                done
+
+                # Prod only: point Knative app URLs at <app>.apps.<Domain>. Runs on
+                # every (re)start because the k3s 'flyte' addon reseeds config-domain
+                # to 'localhost' each time the cluster comes up. Auth needs nothing
+                # started here — the ALB enforces it and the box serves the native
+                # AuthMetadataService (runs.authMetadata) for CLI discovery.
+                if [ "${ProdMode}" = "1" ]; then
+                  systemctl enable --now flyte-appdomain.service
+                  # Brand the Cognito hosted-UI login page with the Flyte logo +
+                  # CSS (assets baked into the AMI). Idempotent + best-effort.
+                  aws cognito-idp set-ui-customization \
+                    --user-pool-id "${CognitoPoolId}" \
+                    --css "$(cat /opt/flyte-devbox/login-ui.css)" \
+                    --image-file "fileb:///opt/flyte-devbox/login-logo.png" \
+                    --region "$AWS_REGION" >/dev/null 2>&1 \
+                    && echo "cognito hosted-UI branded" \
+                    || echo "cognito UI customization failed (continuing)"
+                fi
+
+                systemctl enable --now flyte-idle-agent.service
+
+                echo "[$(date -u +%FT%TZ)] flyte-devbox init done"
+              - AwsRegion: !Ref AWS::Region
+                DevboxImage: !Ref DevboxImage
+                DataDevice: /dev/nvme1n1
+                ProdMode: !Ref ProdMode
+                BucketName: !Ref BucketName
+                DbHost: !Ref DbHost
+                DbPort: !Ref DbPort
+                DbSecretArn: !Ref DbSecretArn
+                CognitoIssuer: !Ref CognitoIssuer
+                CognitoPkceClientId: !Ref CognitoPkceClientId
+                CognitoDomain: !Ref CognitoDomain
+                CognitoWebClientId: !Ref CognitoWebClientId
+                CognitoPoolId: !Ref CognitoPoolId
+                FlyteDomain: !Ref FlyteDomain
+                DataVolumeId: !Ref DataVolumeId
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnetId
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      # The data volume is NOT attached here: user-data self-attaches it by ID at
+      # boot. This keeps the instance freely replaceable (user-data changes apply
+      # via in-place update-stack) instead of failing the EBS attach during the
+      # create-before-delete replacement window.
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  # -------------------------------------------------------------------------
+  # Elastic IP — only in Eval mode with public ingress. Prod mode uses the
+  # ALB DNS name; Private mode skips inbound entirely.
+  # -------------------------------------------------------------------------
+  InstanceEip:
+    Type: AWS::EC2::EIP
+    Condition: WantsEip
+    Properties:
+      Domain: vpc
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-eip"}]
+
+  EipAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: WantsEip
+    Properties:
+      AllocationId: !GetAtt InstanceEip.AllocationId
+      InstanceId: !Ref Instance
+
+  # -------------------------------------------------------------------------
+  # Stop: CloudWatch alarm to SNS to Lambda to ec2:StopInstances.
+  # -------------------------------------------------------------------------
+  StopLambdaRole:
+    Condition: WantsAutoStop
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: stop-actions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:ModifyRule
+                Resource: "*"
+
+  StopLambda:
+    Condition: WantsAutoStop
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt StopLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref Instance
+          # In Prod-wake mode (WantsProdWake) we set FLIP_RULES=1 and pass the
+          # auth rule ARNs + wake-tg so the lambda flips those rules' forward
+          # target to wake-tg before stopping the EC2.
+          FLIP_RULES: !If [WantsProdWake, "1", "0"]
+          LISTENER_ARN: !If [WantsProdWake, !Ref HttpsListener, "n/a"]
+          AUTH_RULE_PRIORITIES: "15,20,25"
+          WAKE_TARGET_GROUP_ARN: !If [WantsProdWake, !Ref WakeTargetGroup, "n/a"]
+      Code:
+        ZipFile: |
+          """CloudWatch-alarm-triggered stop. In Eval/Private mode (FLIP_RULES=0)
+          just calls StopInstances. In Prod-wake mode (FLIP_RULES=1) first flips
+          the ALB auth rules' forward target to wake-tg (preserving each rule's
+          pre-routing auth action), so requests arriving during the stop window
+          land on the wake lambda (which restarts the EC2)."""
+          import logging, os
+          import boto3
+          log = logging.getLogger(); log.setLevel(logging.INFO)
+          INSTANCE_ID = os.environ["INSTANCE_ID"]
+          FLIP_RULES = os.environ.get("FLIP_RULES", "0") == "1"
+          ec2 = boto3.client("ec2")
+          elbv2 = boto3.client("elbv2") if FLIP_RULES else None
+
+          def _flip_to_wake():
+              wake_tg = os.environ["WAKE_TARGET_GROUP_ARN"]
+              listener_arn = os.environ["LISTENER_ARN"]
+              priorities = set(os.environ["AUTH_RULE_PRIORITIES"].split(","))
+              for rule in elbv2.describe_rules(ListenerArn=listener_arn)["Rules"]:
+                  if rule.get("Priority") not in priorities:
+                      continue
+                  actions = []
+                  for a in rule["Actions"]:
+                      if a["Type"] == "forward":
+                          actions.append({"Type": "forward", "Order": a.get("Order", 99),
+                                          "TargetGroupArn": wake_tg})
+                      else:
+                          actions.append(a)
+                  elbv2.modify_rule(RuleArn=rule["RuleArn"], Actions=actions)
+              log.info("auth rules flipped to wake-tg")
+
+          def lambda_handler(event, _ctx):
+              if FLIP_RULES:
+                  _flip_to_wake()
+              ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+              log.info("StopInstances issued for %s", INSTANCE_ID)
+
+  StopAlarmTopic:
+    Condition: WantsAutoStop
+    Type: AWS::SNS::Topic
+    Properties: {TopicName: !Sub "${AWS::StackName}-flyte-idle"}
+
+  StopLambdaSnsPermission:
+    Condition: WantsAutoStop
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StopLambda
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref StopAlarmTopic
+
+  StopLambdaSnsSubscription:
+    Condition: WantsAutoStop
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      TopicArn: !Ref StopAlarmTopic
+      Endpoint: !GetAtt StopLambda.Arn
+
+  IdleAlarm:
+    Condition: WantsAutoStop
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-flyte-idle"
+      Namespace: FlyteDevbox
+      MetricName: IdleMinutes
+      Dimensions: [{Name: InstanceId, Value: !Ref Instance}]
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      DatapointsToAlarm: 5
+      Threshold: !Ref IdleThresholdMinutes
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref StopAlarmTopic]
+
+  # =========================================================================
+  # PROD MODE — created only when Domain is set.
+  # ALB on 443 (HTTPS) with ACM cert (DNS-validated via Route 53).
+  # =========================================================================
+  # Discover the Route 53 hosted zone for Domain so a buyer never has to find or
+  # paste a zone id — they just enter the domain. Walks parent domains and returns
+  # the most specific PUBLIC zone. Feeds the ACM cert validation + the A record.
+  HostedZoneLookupRole:
+    Type: AWS::IAM::Role
+    Condition: IsProd
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: route53-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: route53:ListHostedZonesByName
+                Resource: "*"
+
+  HostedZoneLookupFn:
+    Type: AWS::Lambda::Function
+    Condition: IsProd
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt HostedZoneLookupRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse, boto3
+          def handler(event, context):
+            try:
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}); return
+              domain = event['ResourceProperties']['Domain'].rstrip('.')
+              r53 = boto3.client('route53'); labels = domain.split('.')
+              zid = zname = None
+              for i in range(len(labels) - 1):              # most specific parent first
+                cand = '.'.join(labels[i:]) + '.'
+                for z in r53.list_hosted_zones_by_name(DNSName=cand, MaxItems='5')['HostedZones']:
+                  if z['Name'] == cand and not z['Config'].get('PrivateZone', False):
+                    zid = z['Id'].split('/')[-1]; zname = z['Name']; break
+                if zid: break
+              if not zid:
+                cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                  reason='No public Route 53 hosted zone found for ' + domain); return
+              cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                {'HostedZoneId': zid, 'HostedZoneName': zname})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e)[:200])
+
+  HostedZoneLookup:
+    Type: Custom::HostedZoneLookup
+    Condition: IsProd
+    Properties:
+      ServiceToken: !GetAtt HostedZoneLookupFn.Arn
+      Domain: !Ref Domain
+
+  AlbCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: IsProd
+    Properties:
+      DomainName: !Ref Domain
+      # Wildcard SAN for public app serving hosts (Knative/Kourier):
+      # <app>.apps.<Domain>. One wildcard cert covers every app subdomain.
+      SubjectAlternativeNames:
+        - !Sub "*.apps.${Domain}"
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref Domain
+          HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
+        - DomainName: !Sub "*.apps.${Domain}"
+          HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Condition: IsProd
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetId, !Ref PublicSubnetBId]
+      SecurityGroups: [!Ref AlbSecurityGroupId]
+
+  Ec2TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: IsProd
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: instance
+      # Port 80 = the devbox ingress (traefik NodePort 30080), which answers
+      # HTTP/1.1 Connect for the whole flyteidl2 API + console. Auth is enforced
+      # at the ALB (jwt-validation + authenticate-cognito listener rules below),
+      # so the box itself runs unauthenticated and is only reachable from the ALB.
+      # HTTP/1 target group (default ProtocolVersion): REQUIRED so the ALB can
+      # attach the jwt-validation / authenticate-cognito pre-routing actions,
+      # which AWS does not permit on gRPC/HTTP2 target groups. The flyte v2 CLI
+      # and console both speak Connect over HTTP/1.1, so nothing needs h2 e2e.
+      Port: 80
+      Protocol: HTTP
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200-499" }
+      Targets:
+        - Id: !Ref Instance
+          Port: 80
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: IsProd
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref AlbCertificate
+      # Routing + auth live on the listener RULES below (AuthDiscoveryRule /
+      # ApiJwtRule / ConsoleAuthRule), whose forward target is the active
+      # backend. The wake/stop lambdas flip THOSE rules (not this default)
+      # between the wake lambda and ec2-tg. ConsoleAuthRule matches "/*", so
+      # every real request to the Flyte host is caught by a rule; this default
+      # only fires for an unexpected host/path, hence a plain 404.
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: text/plain
+            MessageBody: "not found"
+
+  # =========================================================================
+  # PUBLIC APP SERVING (Knative/Kourier) — *.apps.<Domain>
+  # A dedicated TG + listener rule sends app-host traffic straight to the
+  # Kourier gateway on :8081, deliberately bypassing the Cognito auth
+  # path AND the wake lambda: apps are public, and if the EC2 is stopped this
+  # TG is simply unhealthy (ALB returns 503) — hitting an app does NOT wake the
+  # box. Kourier host-routes to the right Knative service by the Host header.
+  # =========================================================================
+  AppsTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: IsProd
+    Properties:
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Port: 8081
+      Protocol: HTTP
+      # Kourier answers HTTP/1.1. An ALB health probe carries the target's IP as
+      # Host, which matches no Knative route -> Kourier returns 404; we treat that
+      # as "gateway is up" via the 200-499 matcher.
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 15
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher: { HttpCode: "200-499" }
+      Targets:
+        - Id: !Ref Instance
+          Port: 8081
+
+  AppsListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsProd
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 10
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig:
+            Values: [!Sub "*.apps.${Domain}"]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AppsTargetGroup
+
+  # =========================================================================
+  # AUTH ENFORCEMENT AT THE ALB (replaces the on-box Envoy oauth2/jwt proxy)
+  # Three rules, evaluated before the /* console catch-all:
+  #   15 AuthDiscoveryRule — unauthenticated OAuth2 discovery (CLI needs it
+  #      before it holds a token; served natively by runs.authMetadata).
+  #   20 ApiJwtRule        — Bearer-carrying flyteidl2.* API: validate the JWT
+  #      against Cognito, then forward (SDK / CLI / M2M).
+  #   25 ConsoleAuthRule   — everything else: browser cookie-OIDC SSO.
+  # Each forward target is the ACTIVE backend: ec2-tg normally, or wake-tg while
+  # the box is asleep (the wake/stop lambdas flip these rules). Referencing
+  # WakeTargetGroup only in the WantsProdWake branch keeps it valid when there is
+  # no wake target group.
+  # =========================================================================
+  AuthDiscoveryRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsProd
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 15
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - /flyteidl2.auth.AuthMetadataService/*
+              - /.well-known/*
+              - /healthz
+              - /readyz
+      Actions:
+        - Type: forward
+          TargetGroupArn: !If [WantsProdWake, !Ref WakeTargetGroup, !Ref Ec2TargetGroup]
+
+  ApiJwtRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsProd
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 20
+      # Match only API requests that actually carry a Bearer token. Browser
+      # console API calls authenticate via the ALB session cookie instead (no
+      # Authorization header) and fall through to ConsoleAuthRule.
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [/flyteidl2.*]
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: Authorization
+            Values: ["Bearer *"]
+      Actions:
+        - Type: jwt-validation
+          Order: 1
+          JwtValidationConfig:
+            Issuer: !Ref CognitoIssuer
+            JwksEndpoint: !Sub "${CognitoIssuer}/.well-known/jwks.json"
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !If [WantsProdWake, !Ref WakeTargetGroup, !Ref Ec2TargetGroup]
+
+  ConsoleAuthRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsProd
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 25
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: ["/*"]
+      Actions:
+        - Type: authenticate-cognito
+          Order: 1
+          AuthenticateCognitoConfig:
+            UserPoolArn: !Ref CognitoUserPoolArn
+            UserPoolClientId: !Ref CognitoWebClientId
+            UserPoolDomain: !Ref CognitoDomainPrefix
+            OnUnauthenticatedRequest: authenticate
+            SessionTimeout: 604800
+        - Type: forward
+          Order: 2
+          TargetGroupArn: !If [WantsProdWake, !Ref WakeTargetGroup, !Ref Ec2TargetGroup]
+
+  # =========================================================================
+  # PROD wake-on-request mechanism (only when AutoStop=Yes)
+  # =========================================================================
+  WakeTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Condition: WantsProdWake
+    DependsOn: WakeLambdaPermission
+    Properties:
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt WakeLambda.Arn
+
+  WakeLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: WantsProdWake
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: wake-actions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ec2:DescribeInstances, ec2:StartInstances]
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeRules
+                  - elasticloadbalancing:ModifyRule
+                Resource: "*"
+
+  WakeLambda:
+    Type: AWS::Lambda::Function
+    Condition: WantsProdWake
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt WakeLambdaRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref Instance
+          EC2_TARGET_GROUP_ARN: !Ref Ec2TargetGroup
+          # Flip the auth listener rules (matched by priority at runtime, to avoid
+          # a WakeLambda<->rule<->wake-tg dependency cycle) via this listener.
+          LISTENER_ARN: !Ref HttpsListener
+          AUTH_RULE_PRIORITIES: "15,20,25"
+          COGNITO_ISSUER: !Ref CognitoIssuer
+          COGNITO_DOMAIN: !Sub "https://${CognitoDomain}"
+          COGNITO_PKCE_CLIENT_ID: !Ref CognitoPkceClientId
+      Code:
+        ZipFile: |
+          """Prod-mode wake handler. ALB targets this lambda while the EC2 is stopped.
+
+          Auth is enforced at the ALB (jwt-validation / authenticate-cognito on the
+          listener rules), so any request that reaches this lambda has ALREADY been
+          authenticated -- except the unauthenticated auth-discovery paths, which we
+          answer inline (byte-compatible with the box's native AuthMetadataService)
+          so the CLI can log in while the box is asleep WITHOUT waking it. Everything
+          else starts the EC2 and, once ec2-tg is healthy, flips the auth rules back
+          to ec2-tg so the next request hits the box directly. A 'starting' page polls."""
+          import base64, json, logging, os
+          import boto3
+
+          log = logging.getLogger(); log.setLevel(logging.INFO)
+
+          INSTANCE_ID = os.environ["INSTANCE_ID"]
+          EC2_TG_ARN = os.environ["EC2_TARGET_GROUP_ARN"]
+          LISTENER_ARN = os.environ["LISTENER_ARN"]
+          AUTH_RULE_PRIORITIES = set(os.environ["AUTH_RULE_PRIORITIES"].split(","))
+          COGNITO_ISSUER = os.environ["COGNITO_ISSUER"]
+          COGNITO_DOMAIN = os.environ["COGNITO_DOMAIN"]
+          PKCE_CLIENT_ID = os.environ["COGNITO_PKCE_CLIENT_ID"]
+
+          ec2 = boto3.client("ec2")
+          elbv2 = boto3.client("elbv2")
+
+          # --- AuthMetadataService discovery, served here so the CLI can discover
+          # Cognito while the box is ASLEEP (the box's native endpoint is
+          # unreachable then). Hand-encoded protobuf (stdlib only) to byte-match
+          # the box's GetOAuth2Metadata / GetPublicClientConfig responses. ---
+          def _vw(n):
+              o = bytearray()
+              while True:
+                  b = n & 0x7f; n >>= 7
+                  o.append(b | (0x80 if n else 0))
+                  if not n:
+                      return bytes(o)
+
+          def _pf(num, s):
+              d = s.encode()
+              return _vw((num << 3) | 2) + _vw(len(d)) + d
+
+          def _meta():
+              return (_pf(1, COGNITO_ISSUER) + _pf(2, COGNITO_DOMAIN + "/oauth2/authorize")
+                  + _pf(3, COGNITO_DOMAIN + "/oauth2/token") + _pf(4, "code")
+                  + _pf(5, "openid") + _pf(5, "profile")
+                  + _pf(7, COGNITO_ISSUER + "/.well-known/jwks.json") + _pf(8, "S256")
+                  + _pf(9, "authorization_code") + _pf(9, "refresh_token"))
+
+          def _pcc():
+              return (_pf(1, PKCE_CLIENT_ID) + _pf(2, "http://localhost:8089/callback")
+                  + _pf(3, "openid") + _pf(3, "profile") + _pf(4, "authorization"))
+
+          def _proto(b):
+              return {"statusCode": 200, "headers": {"Content-Type": "application/proto"},
+                  "body": base64.b64encode(b).decode(), "isBase64Encoded": True}
+
+          PAGE = """<!doctype html><html><head><meta charset="utf-8">
+          <meta http-equiv="refresh" content="15; url=/v2">
+          <title>Starting Flyte devbox</title><style>
+          body{font-family:-apple-system,system-ui,sans-serif;background:#0f1115;color:#d8dee9;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+          .box{text-align:center;max-width:520px;padding:24px}
+          .spinner{width:48px;height:48px;border:4px solid #3b4252;border-top-color:#88c0d0;border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 24px}
+          @keyframes spin{to{transform:rotate(360deg)}}
+          .detail{color:#6c7382;font-size:0.9em;margin-top:16px}
+          </style></head><body><div class="box"><div class="spinner"></div>
+          <h2>__TITLE__</h2><p class="detail">__DETAIL__</p>
+          <p class="detail">Signed in - returning to the app automatically.</p>
+          </div></body></html>"""
+
+          def _wants_html(event):
+              h = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
+              return "text/html" in h.get("accept", "")
+
+          def _response(event, status, title, detail):
+              if _wants_html(event):
+                  body = PAGE.replace("__TITLE__", title).replace("__DETAIL__", detail)
+                  return {"statusCode": status, "headers": {"Content-Type": "text/html; charset=utf-8"}, "body": body}
+              return {"statusCode": 503, "headers": {"Content-Type": "application/json", "Retry-After": "20"},
+                      "body": '{"status":"waking","title":"%s"}' % title}
+
+          def _flip_to_ec2():
+              # Point every auth rule's forward action back at ec2-tg, preserving
+              # the rule's pre-routing auth action (jwt-validation / cognito). The
+              # rules are found by priority to avoid a deploy-time dependency cycle.
+              for rule in elbv2.describe_rules(ListenerArn=LISTENER_ARN)["Rules"]:
+                  if rule.get("Priority") not in AUTH_RULE_PRIORITIES:
+                      continue
+                  actions = []
+                  for a in rule["Actions"]:
+                      if a["Type"] == "forward":
+                          actions.append({"Type": "forward", "Order": a.get("Order", 99),
+                                          "TargetGroupArn": EC2_TG_ARN})
+                      else:
+                          actions.append(a)
+                  elbv2.modify_rule(RuleArn=rule["RuleArn"], Actions=actions)
+              log.info("auth rules flipped to ec2-tg")
+
+          def _wake(event):
+              state = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
+              log.info("wake invoked state=%s", state)
+              if state == "stopped":
+                  ec2.start_instances(InstanceIds=[INSTANCE_ID])
+                  return _response(event, 200, "Starting your Flyte devbox", "EC2 boot + Docker + k3s startup takes about 2 minutes.")
+              if state in ("pending", "stopping"):
+                  return _response(event, 200, "Devbox is " + state, "Reload in a moment.")
+              if state == "running":
+                  resp = elbv2.describe_target_health(TargetGroupArn=EC2_TG_ARN)
+                  healthy = any(d["TargetHealth"]["State"] == "healthy" for d in resp["TargetHealthDescriptions"])
+                  if healthy:
+                      _flip_to_ec2()
+                      return _response(event, 200, "Ready", "Returning to the app...")
+                  return _response(event, 200, "Devbox is starting", "Flyte services coming up - give it another moment.")
+              return _response(event, 503, "Unknown state: " + state, "Check the AWS console.")
+
+          def lambda_handler(event, _ctx):
+              path = event.get("path", "/")
+              # Unauthenticated auth-discovery (no wake) so the CLI can log in while
+              # the box is asleep; the authenticated retry then wakes it.
+              if path.endswith("/flyteidl2.auth.AuthMetadataService/GetOAuth2Metadata"):
+                  return _proto(_meta())
+              if path.endswith("/flyteidl2.auth.AuthMetadataService/GetPublicClientConfig"):
+                  return _proto(_pcc())
+              # Health/discovery probes must not wake the box.
+              if path.startswith("/healthz") or path.startswith("/readyz") or path.startswith("/.well-known/"):
+                  return {"statusCode": 503, "headers": {"Content-Type": "text/plain", "Retry-After": "20"}, "body": "asleep\n"}
+              # Anything else reached a rule with an ALB auth action, so it is
+              # already authenticated -> wake.
+              return _wake(event)
+  WakeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: WantsProdWake
+    Properties:
+      FunctionName: !Ref WakeLambda
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+
+  # /  ->  /v2  redirect (UI convenience), same as Eval mode. Scoped to the
+  # primary Flyte domain ONLY — without the host-header condition this path-based
+  # rule (priority 1) also catches app hosts (*.apps.<Domain>/), 302-ing them to
+  # <app-host>/v2, which the app doesn't serve (404). Apps must reach their root.
+  RootRedirectRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: IsProd
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 1
+      Conditions:
+        - Field: host-header
+          HostHeaderConfig: { Values: [!Ref Domain] }
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/"] }
+      Actions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Host: "#{host}"
+            Path: /v2
+            Query: "#{query}"
+            StatusCode: HTTP_302
+
+  # Keeps ec2-tg referenced by the listener (and therefore continuously health-
+  # checked) even while the default action points at the wake lambda. Without a
+  # listener referencing it, ALB stops health-checking the TG and the wake lambda
+  # can't tell when the EC2 is ready to flip back to. The path never matches real
+  # traffic; this rule exists only to hold the reference. Only needed in the wake
+  # configuration (in always-on mode the default action already references ec2-tg).
+  Ec2KeepAliveRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Condition: WantsProdWake
+    Properties:
+      ListenerArn: !Ref HttpsListener
+      Priority: 2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig: { Values: ["/__ec2-health-keepalive__"] }
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref Ec2TargetGroup
+
+  DomainRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsProd
+    Properties:
+      HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
+      Name: !Ref Domain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # Wildcard for public app hosts: <app>.apps.<Domain> -> ALB. Kourier then
+  # host-routes to the matching Knative service. One record covers all apps.
+  AppsWildcardRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: IsProd
+    Properties:
+      HostedZoneId: !GetAtt HostedZoneLookup.HostedZoneId
+      Name: !Sub "*.apps.${Domain}"
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+Outputs:
+  InstanceId:
+    Value: !Ref Instance
+  InstancePublicDnsName:
+    Value: !GetAtt Instance.PublicDnsName
+  EipAddress:
+    Condition: WantsEip
+    Value: !Ref InstanceEip

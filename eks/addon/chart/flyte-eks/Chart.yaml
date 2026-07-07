@@ -1,0 +1,23 @@
+apiVersion: v2
+name: flyte-eks
+description: >-
+  Flyte 2 backend for Amazon EKS, packaged as an AWS Marketplace EKS add-on.
+  Thin wrapper over the upstream flyte-binary chart that pins stable, EKS-native
+  defaults (S3 object store via Pod Identity, external Aurora PostgreSQL, ALB
+  ingress) and exposes only the per-deployment knobs via the add-on
+  configuration schema.
+type: application
+
+# Wrapper chart version. Keep in lockstep with ADDON_VERSION in versions.env.
+version: 0.1.0
+
+# The Flyte backend version this add-on delivers (flyte-binary appVersion).
+appVersion: "2.0.27"
+
+dependencies:
+  # Pinned to FLYTE_CHART_VERSION in versions.env. Vendored into charts/ by
+  # scripts/vendor-chart.sh so the add-on package has no install-time network
+  # dependency (an AWS Marketplace / Conformitron requirement).
+  - name: flyte-binary
+    version: v2.0.27
+    repository: https://helm.flyte.org

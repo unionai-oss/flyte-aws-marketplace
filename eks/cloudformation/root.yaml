@@ -1,0 +1,149 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flyte 2 on Amazon EKS — full-stack AWS Marketplace product. Provisions VPC,
+  EKS, Aurora Serverless v2, S3, IAM (Pod Identity), optional Cognito auth, and
+  installs the Flyte backend via the add-on-vs-helm resolver. The data and auth
+  layers are the shared common/ templates, nested here with EKS-specific values.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Cluster }
+        Parameters: [ClusterName, KubernetesVersion, NodeInstanceType, NodeDesiredSize, NodeMinSize, NodeMaxSize]
+      - Label: { default: Database }
+        Parameters: [DBMinCapacity, DBMaxCapacity, DBEngineVersion]
+      - Label: { default: "Auth (prod mode — leave DomainName blank for dev mode)" }
+        Parameters: [DomainName, HostedZoneId, CognitoDomainPrefix]
+      - Label: { default: Source }
+        Parameters: [RepoUrl, RepoRef]
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: flyte
+    AllowedPattern: "[a-z][a-z0-9-]{1,38}"
+  KubernetesVersion: { Type: String, Default: "1.31" }
+  NodeInstanceType: { Type: String, Default: m6i.2xlarge }
+  NodeDesiredSize: { Type: Number, Default: 2 }
+  NodeMinSize: { Type: Number, Default: 2 }
+  NodeMaxSize: { Type: Number, Default: 6 }
+  DBMinCapacity: { Type: Number, Default: 0 }
+  DBMaxCapacity: { Type: Number, Default: 16 }
+  DBEngineVersion: { Type: String, Default: "17.9" }
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Base domain for prod mode (e.g. example.com). Blank = dev mode (no ingress/auth).
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route 53 hosted zone id for DomainName (required in prod mode).
+  CognitoDomainPrefix:
+    Type: String
+    Default: ""
+    Description: Globally-unique Cognito hosted-UI prefix (required in prod mode).
+  RepoUrl:
+    Type: String
+    Default: https://github.com/unionai-oss/flyte-aws-marketplace.git
+  RepoRef: { Type: String, Default: main }
+
+Conditions:
+  IsProd: !Not [!Equals [!Ref DomainName, ""]]
+
+Resources:
+  Network:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/network.yaml
+      Parameters:
+        ClusterName: !Ref ClusterName
+
+  Eks:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/eks.yaml
+      Parameters:
+        ClusterName: !Ref ClusterName
+        KubernetesVersion: !Ref KubernetesVersion
+        PrivateSubnetIds: !GetAtt Network.Outputs.PrivateSubnetIds
+        ClusterSubnetIds: !Join
+          - ","
+          - - !GetAtt Network.Outputs.PrivateSubnetIds
+            - !GetAtt Network.Outputs.PublicSubnetIds
+        NodeInstanceType: !Ref NodeInstanceType
+        NodeDesiredSize: !Ref NodeDesiredSize
+        NodeMinSize: !Ref NodeMinSize
+        NodeMaxSize: !Ref NodeMaxSize
+
+  Data:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: ../../common/cloudformation/data.yaml
+      Parameters:
+        NamePrefix: !Sub "flyte-${ClusterName}"
+        VpcId: !GetAtt Network.Outputs.VpcId
+        SubnetIds: !GetAtt Network.Outputs.PrivateSubnetIds
+        ClientSecurityGroupId: !GetAtt Eks.Outputs.ClusterSecurityGroupId
+        DBSecretName: !Sub "${ClusterName}/flyte/db"
+        EcrRepositoryName: !Sub "${ClusterName}-flyte-tasks"
+        DBMinCapacity: !Ref DBMinCapacity
+        DBMaxCapacity: !Ref DBMaxCapacity
+        EngineVersion: !Ref DBEngineVersion
+
+  Iam:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/iam.yaml
+      Parameters:
+        ClusterName: !Ref ClusterName
+        BucketArn: !GetAtt Data.Outputs.BucketArn
+
+  Auth:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsProd
+    Properties:
+      TemplateURL: ../../common/cloudformation/auth.yaml
+      Parameters:
+        NamePrefix: !Ref ClusterName
+        FlyteHost: !Sub "flyte.${DomainName}"
+        CognitoDomainPrefix: !Ref CognitoDomainPrefix
+
+  Flyte:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/flyte.yaml
+      Parameters:
+        ClusterName: !Ref ClusterName
+        RepoUrl: !Ref RepoUrl
+        RepoRef: !Ref RepoRef
+        DBSecretArn: !GetAtt Data.Outputs.DBSecretArn
+        DBEndpoint: !GetAtt Data.Outputs.DBEndpoint
+        DBPort: !GetAtt Data.Outputs.DBPort
+        DBName: !GetAtt Data.Outputs.DBName
+        DBUsername: !GetAtt Data.Outputs.DBUsername
+        BucketName: !GetAtt Data.Outputs.BucketName
+        FlyteS3RoleArn: !GetAtt Iam.Outputs.FlyteS3RoleArn
+        DomainName: !Ref DomainName
+        HostedZoneId: !Ref HostedZoneId
+        CognitoIssuer: !If [IsProd, !GetAtt Auth.Outputs.Issuer, ""]
+        CognitoClientId: !If [IsProd, !GetAtt Auth.Outputs.UserPoolClientId, ""]
+        CognitoUserPoolArn: !If [IsProd, !GetAtt Auth.Outputs.UserPoolArn, ""]
+        CognitoDomainPrefix: !If [IsProd, !GetAtt Auth.Outputs.CognitoDomainPrefix, ""]
+        CognitoCliClientId: !If [IsProd, !GetAtt Auth.Outputs.CliClientId, ""]
+
+Outputs:
+  ClusterName:
+    Value: !GetAtt Eks.Outputs.ClusterName
+  BucketName:
+    Value: !GetAtt Data.Outputs.BucketName
+  EcrRepositoryUri:
+    Description: ECR repo for Flyte task images (push target for the SDK image builder).
+    Value: !GetAtt Data.Outputs.EcrRepositoryUri
+  DBEndpoint:
+    Value: !GetAtt Data.Outputs.DBEndpoint
+  FlyteEndpoint:
+    Description: Flyte endpoint (prod mode). Dev mode uses kubectl port-forward.
+    Value: !If [IsProd, !Sub "https://flyte.${DomainName}", "dev-mode: kubectl -n flyte port-forward svc/flyte-flyte-binary-grpc 8089"]
+  CognitoDomain:
+    Condition: IsProd
+    Value: !GetAtt Auth.Outputs.CognitoDomain
