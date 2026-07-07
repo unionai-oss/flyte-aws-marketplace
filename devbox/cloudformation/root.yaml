@@ -483,6 +483,7 @@ Resources:
       TemplateURL: templates/compute.yaml
       Parameters:
         Domain: !Ref Domain
+        RootStackName: !Ref AWS::StackName
         InstanceType: !Ref InstanceType
         IdleThresholdMinutes: !Ref IdleThresholdMinutes
         DevboxImage: !Ref DevboxImage

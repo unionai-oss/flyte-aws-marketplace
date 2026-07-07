@@ -13,6 +13,13 @@ Parameters:
     Type: String
     Default: ""
     Description: Empty = Eval mode; set = Prod mode (ALB + ACM + Route 53).
+  RootStackName:
+    Type: String
+    Description: >-
+      Root stack name, used for user-facing resource names/tags. Passed
+      explicitly because AWS::StackName inside a nested stack resolves to the
+      nested stack's name — the StartCli/StopCli outputs filter on the instance's
+      Name tag, which must be the root name.
   InstanceType:
     Type: String
     Default: m6i.2xlarge
@@ -347,7 +354,7 @@ Resources:
       # create-before-delete replacement window.
       Tags:
         - Key: Name
-          Value: !Ref AWS::StackName
+          Value: !Ref RootStackName
 
   # -------------------------------------------------------------------------
   # Elastic IP — only in Eval mode with public ingress. Prod mode uses the
@@ -358,7 +365,7 @@ Resources:
     Condition: WantsEip
     Properties:
       Domain: vpc
-      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-eip"}]
+      Tags: [{Key: Name, Value: !Sub "${RootStackName}-eip"}]
 
   EipAssociation:
     Type: AWS::EC2::EIPAssociation
@@ -457,7 +464,7 @@ Resources:
   StopAlarmTopic:
     Condition: WantsAutoStop
     Type: AWS::SNS::Topic
-    Properties: {TopicName: !Sub "${AWS::StackName}-flyte-idle"}
+    Properties: {TopicName: !Sub "${RootStackName}-flyte-idle"}
 
   StopLambdaSnsPermission:
     Condition: WantsAutoStop
@@ -480,7 +487,7 @@ Resources:
     Condition: WantsAutoStop
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub "${AWS::StackName}-flyte-idle"
+      AlarmName: !Sub "${RootStackName}-flyte-idle"
       Namespace: FlyteDevbox
       MetricName: IdleMinutes
       Dimensions: [{Name: InstanceId, Value: !Ref Instance}]
