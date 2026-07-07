@@ -397,7 +397,7 @@ Resources:
         SubnetIds: !Join [",", [!Ref PublicSubnet, !Ref PublicSubnetB]]
         ClientSecurityGroupId: !Ref InstanceSecurityGroup
         DBSecretName: !Sub "${AWS::StackName}-flyte-db"
-        EcrRepositoryName: !Sub "${AWS::StackName}-flyte"
+        EcrNamespace: !Sub "${AWS::StackName}-flyte"
         DBMinCapacity: 0
         DBMaxCapacity: 4
         BackupRetentionPeriod: 7
@@ -457,6 +457,9 @@ Resources:
               - ecr:UploadLayerPart
               - ecr:CompleteLayerUpload
               - ecr:PutImage
+              # Server-side/remote image builds push new image names; create-on-push
+              # auto-creates the repo, which requires this on the pushing identity.
+              - ecr:CreateRepository
             Resource: "*"
           - Effect: Allow
             Action: secretsmanager:GetSecretValue
@@ -591,19 +594,20 @@ Outputs:
     Description: ARN of the Secrets Manager secret holding the Aurora master password.
     Value: !GetAtt CommonData.Outputs.DBSecretArn
 
-  ProdEcrUri:
+  ProdImageRegistry:
     Condition: IsProd
-    Description: ECR repository URI (Prod mode; for docker push from build pipelines).
-    Value: !GetAtt CommonData.Outputs.EcrRepositoryUri
+    Description: >-
+      ECR registry namespace for Flyte task images. Any image name auto-creates on
+      push (create-on-push), so no per-image repo setup.
+    Value: !GetAtt CommonData.Outputs.EcrRegistry
 
   ImageRegistryConfig:
     Condition: IsProd
     Description: >-
-      One-shot CLI config so SDK image builds push to this stack's ECR (all
-      `flyte run`/deploy builds then target it automatically). The --registry flag
-      requires a flyte SDK that includes flyteorg/flyte-sdk#1278; until then set
-      registry=<ProdEcrUri host>, name=<repo> on the Image in code.
-    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type pkce --registry ${CommonData.Outputs.EcrRepositoryUri}"
+      One-shot CLI config so SDK image builds push to this stack's ECR. Any image
+      name works (repos auto-create on push). The --registry flag needs a flyte SDK
+      with flyteorg/flyte-sdk#1278; otherwise set `image.registry` in the config.
+    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type pkce --registry ${CommonData.Outputs.EcrRegistry}"
 
   # ---- Always-on outputs --------------------------------------------------
   InstanceId:

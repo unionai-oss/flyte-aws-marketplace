@@ -41,7 +41,9 @@ teardown() {
   # Delete resources whose DeletionPolicy is Retain/Snapshot — they survive the
   # stack and, having deterministic names (${StackName}-flyte, -flyte-data),
   # would make the NEXT run's CREATE change-set fail. Best-effort.
-  aws_ ecr delete-repository --repository-name "${STACK_NAME}-flyte" --force >/dev/null 2>&1 || true
+  for r in $(aws_ ecr describe-repositories --query "repositories[?starts_with(repositoryName, '${STACK_NAME}-flyte/')].repositoryName" --output text 2>/dev/null); do
+    aws_ ecr delete-repository --repository-name "$r" --force >/dev/null 2>&1 || true
+  done
   aws_ backup delete-backup-vault --backup-vault-name "${STACK_NAME}-flyte-data" >/dev/null 2>&1 || true
   log "Teardown complete"
 }
@@ -156,30 +158,31 @@ fi
 
 APP_NAME="smoke-app"
 ECR=$(aws_ cloudformation describe-stacks --stack-name "$STACK_NAME" \
-  --query "Stacks[0].Outputs[?OutputKey=='ProdEcrUri'].OutputValue" --output text)
-ECR_REGISTRY="${ECR%/*}"; ECR_REPO="${ECR##*/}"
+  --query "Stacks[0].Outputs[?OutputKey=='ProdImageRegistry'].OutputValue" --output text)
+ECR_HOST="${ECR%%/*}"   # <acct>.dkr.ecr.<region>.amazonaws.com
+NS="${ECR#*/}"          # <stack>-flyte  (namespace after the host)
 
-log "Docker login to the stack ECR ($ECR_REGISTRY)"
-aws_ ecr get-login-password | docker login --username AWS --password-stdin "$ECR_REGISTRY" >/dev/null 2>&1
+log "Docker login to the stack ECR ($ECR_HOST)"
+aws_ ecr get-login-password | docker login --username AWS --password-stdin "$ECR_HOST" >/dev/null 2>&1
 
-# Unique per-run marker baked into the image so its content-hash tag is always
-# new. flyte skips build+push when it thinks the tag already exists (persistent
-# SQLite cache, or the registry probe erroring -> "assume it exists"); a fresh
-# tag every run guarantees a real build+push into this run's fresh ECR repo.
+# Unique per-run image NAME (not just tag) so we exercise ECR create-on-push:
+# the SDK pushes <namespace>/<name> to a repo that does not exist yet, and the
+# stack's repository creation template auto-creates it. Also defeats flyte's
+# build-skip cache (a fresh name every run guarantees a real build+push).
 RUN_ID=$(date +%s)-$$
+IMG_NAME="smoke-${RUN_ID}"
 
 cat > "$WORK/app.py" <<PY
 import flyte, flyte.app
 # The app just needs to listen on 8080 and answer 200 so we can prove the whole
-# path (custom image -> ECR -> Knative -> ALB). Use the stdlib directory server:
-# its argv has only clean tokens, which matters because flyte round-trips app
-# args through shlex+shell (a python -c one-liner gets mangled). It serves 200 at
-# '/', which is what we poll, and listening satisfies Knative's readiness probe.
-# .with_pip_packages forces a real (non-default) image build -> pushed to the
-# stack ECR; single-platform (amd64) to keep it fast; the unique env var makes
-# the content-hash tag new each run (defeats flyte's build-skip cache).
+# path (custom image -> ECR create-on-push -> Knative -> ALB). Use the stdlib
+# directory server: its argv has only clean tokens, which matters because flyte
+# round-trips app args through shlex+shell (a python -c one-liner gets mangled).
+# It serves 200 at '/', which is what we poll, and listening satisfies Knative's
+# readiness probe. .with_pip_packages forces a real (non-default) image build;
+# the custom image name pushes to a NEW ECR repo (auto-created on push).
 image = flyte.Image.from_debian_base(
-    python_version=(3, 12), registry="$ECR_REGISTRY", name="$ECR_REPO",
+    python_version=(3, 12), registry="$ECR", name="$IMG_NAME",
     platform=("linux/amd64",),
 ).with_pip_packages("httpx").with_env_vars({"SMOKE_BUILD_ID": "$RUN_ID"})
 app_env = flyte.app.AppEnvironment(
@@ -188,7 +191,7 @@ app_env = flyte.app.AppEnvironment(
 )
 PY
 
-log "Deploying app (build custom image -> push ECR -> register)"
+log "Deploying app (build custom image -> create-on-push to ECR -> register)"
 if (cd "$WORK" && "$FLYTE" --config .config.yaml deploy app.py app_env) >"$WORK/deploy.log" 2>&1; then
   sed 's/\x1b\[[0-9;]*m//g' "$WORK/deploy.log" | tail -4
 else
@@ -196,10 +199,11 @@ else
   log "❌ APP SMOKE FAILED — deploy (build/push/register) errored"; exit 1
 fi
 
-# Guard: confirm the custom image actually landed in ECR (catches a silent
-# build-skip, which otherwise surfaces only as a Knative image-pull 404 later).
-if [ "$(aws_ ecr list-images --repository-name "$ECR_REPO" --query 'length(imageIds)' --output text 2>/dev/null)" = "0" ]; then
-  log "❌ APP SMOKE FAILED — custom image was not pushed to $ECR_REPO (build skipped?)"; exit 1
+# Guard: confirm create-on-push auto-created the repo AND the image landed
+# (catches a silent build-skip, which otherwise surfaces only as a Knative
+# image-pull 404 later).
+if [ "$(aws_ ecr list-images --repository-name "${NS}/${IMG_NAME}" --query 'length(imageIds)' --output text 2>/dev/null)" = "0" ]; then
+  log "❌ APP SMOKE FAILED — image not auto-created/pushed to ${NS}/${IMG_NAME}"; exit 1
 fi
 
 # Public URL is <app>-<project>-<domain>.apps.<Domain> (Knative ksvc name). Poll

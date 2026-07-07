@@ -47,11 +47,12 @@ Parameters:
     Type: Number
     Default: 1
     Description: Automated backup retention in days.
-  EcrRepositoryName:
+  EcrNamespace:
     Type: String
     Description: >-
-      Name of the ECR repository for Flyte task images. Retained on stack delete
-      (like the S3 bucket), so pick a per-deployment-unique name.
+      ECR namespace prefix for Flyte task images. A repository creation template
+      auto-creates <namespace>/<image>:<tag> on push (create-on-push), so users
+      never pre-create a repo per image name.
 
 Resources:
   # ---- S3 object store (superset of both products' features) ----
@@ -79,18 +80,21 @@ Resources:
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 7
 
-  # ---- ECR repository for Flyte task images ----
-  # Developers push task images here; the compute layer pulls them. Retained on
-  # stack delete (matching the S3 bucket) so images survive a teardown/redeploy.
-  TaskImageRepository:
-    Type: AWS::ECR::Repository
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
+  # ---- ECR create-on-push for Flyte task images ----
+  # The flyte SDK image builder pushes <namespace>/<image-name>:<content-hash>,
+  # where <image-name> varies per workflow. ECR has no repo until first push, so
+  # a repository creation template (GA Dec 2025) auto-creates any repo under the
+  # namespace on push — no per-image-name pre-creation. The pushing identity just
+  # needs ecr:CreateRepository (marketplace deployers have it; the compute role is
+  # granted it too for server-side builds).
+  ImageRepoTemplate:
+    Type: AWS::ECR::RepositoryCreationTemplate
     Properties:
-      RepositoryName: !Ref EcrRepositoryName
-      ImageScanningConfiguration:
-        ScanOnPush: true
+      Prefix: !Ref EcrNamespace
+      AppliedFor:
+        - CREATE_ON_PUSH
       ImageTagMutability: MUTABLE
+      Description: !Sub "Auto-create Flyte task-image repos under ${EcrNamespace}/*"
 
   # ---- DB password (generated, never surfaced in a parameter) ----
   DBSecret:
@@ -174,6 +178,8 @@ Outputs:
     Value: !Ref DBName
   DBUsername:
     Value: !Ref DBUsername
-  EcrRepositoryUri:
-    Description: ECR repository for Flyte task images (push target for the SDK image builder).
-    Value: !GetAtt TaskImageRepository.RepositoryUri
+  EcrRegistry:
+    Description: >-
+      ECR registry namespace for Flyte task images. Push <this>/<name>:<tag>; the
+      repo auto-creates on push for any <name>.
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrNamespace}"

@@ -85,7 +85,7 @@ Resources:
         SubnetIds: !GetAtt Network.Outputs.PrivateSubnetIds
         ClientSecurityGroupId: !GetAtt Eks.Outputs.ClusterSecurityGroupId
         DBSecretName: !Sub "${ClusterName}/flyte/db"
-        EcrRepositoryName: !Sub "${ClusterName}-flyte-tasks"
+        EcrNamespace: !Sub "${ClusterName}-flyte-tasks"
         DBMinCapacity: !Ref DBMinCapacity
         DBMaxCapacity: !Ref DBMaxCapacity
         EngineVersion: !Ref DBEngineVersion
@@ -136,9 +136,9 @@ Outputs:
     Value: !GetAtt Eks.Outputs.ClusterName
   BucketName:
     Value: !GetAtt Data.Outputs.BucketName
-  EcrRepositoryUri:
-    Description: ECR repo for Flyte task images (push target for the SDK image builder).
-    Value: !GetAtt Data.Outputs.EcrRepositoryUri
+  EcrRegistry:
+    Description: ECR registry namespace for Flyte task images (any name auto-creates on push).
+    Value: !GetAtt Data.Outputs.EcrRegistry
   DBEndpoint:
     Value: !GetAtt Data.Outputs.DBEndpoint
   FlyteEndpoint:
