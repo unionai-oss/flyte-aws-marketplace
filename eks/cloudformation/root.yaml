@@ -143,7 +143,7 @@ Outputs:
     Value: !GetAtt Data.Outputs.DBEndpoint
   FlyteEndpoint:
     Description: Flyte endpoint (prod mode). Dev mode uses kubectl port-forward.
-    Value: !If [IsProd, !Sub "https://flyte.${DomainName}", "dev-mode: kubectl -n flyte port-forward svc/flyte-flyte-binary-grpc 8089"]
+    Value: !If [IsProd, !Sub "https://flyte.${DomainName}", "dev-mode: kubectl -n flyte port-forward svc/flyte-flyte-binary-http 8089:8090  (then --endpoint dns:///localhost:8089 --insecure)"]
   CognitoDomain:
     Condition: IsProd
     Value: !GetAtt Auth.Outputs.CognitoDomain
