@@ -77,9 +77,17 @@ def _recent_ui_activity() -> bool:
         if not line.startswith("{") or '"RequestPath"' not in line:
             continue
         try:
-            path = json.loads(line).get("RequestPath", "")
+            entry = json.loads(line)
         except ValueError:
             continue
+        # This agent polls the API at localhost:80 every minute (_any_active_runs);
+        # traefik logs those too. Ignore them (RequestHost=localhost) so the agent
+        # never counts its OWN polling as user activity — otherwise the idle counter
+        # resets every minute and the box never auto-stops. Real console/CLI use
+        # arrives via the ALB carrying the Flyte host header, not "localhost".
+        if entry.get("RequestHost") == "localhost":
+            continue
+        path = entry.get("RequestPath", "")
         if path and not any(path.startswith(h) for h in _HEALTH_PATHS):
             return True
     return False
