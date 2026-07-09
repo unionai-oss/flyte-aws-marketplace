@@ -1,0 +1,18 @@
+[Unit]
+Description=Flyte devbox idle polling agent
+After=flyte-devbox.service network-online.target
+Wants=flyte-devbox.service network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/flyte-idle-agent/env
+# Reset idle counter on every EC2 boot so the auto-stop alarm
+# doesn't fire immediately when starting from a stopped state.
+ExecStartPre=/bin/rm -f /var/lib/flyte-idle-agent/state
+ExecStart=/opt/flyte-idle-agent/venv/bin/python /opt/flyte-idle-agent/flyte_idle_agent.py
+Restart=always
+RestartSec=15
+User=root
+
+[Install]
+WantedBy=multi-user.target

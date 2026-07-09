@@ -1,0 +1,36 @@
+# Vendored chart artifacts (fetched by eks/scripts/vendor-chart.sh, not committed)
+eks/addon/chart/vendor/
+eks/addon/chart/*/charts/
+*.tgz
+
+# Rendered / generated files
+*.rendered.yaml
+build/
+dist/
+
+# Packer build artifacts
+packer/packer_cache/
+packer/*.manifest
+crash.log
+crash.*.log
+
+# Logs
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local env / secrets — never commit credentials
+.env
+.env.local
+kubeconfig*
+*.pem
+*.tfstate*
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

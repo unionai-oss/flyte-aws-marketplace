@@ -1,0 +1,8 @@
+ignore_checks:
+  # Nested-stack TemplateURLs are local paths resolved by `aws cloudformation
+  # package` / the deploy scripts — this is intentional across common/devbox/eks.
+  - W3002
+  # Prod-only ids (ALB security group, second subnet) reach the devbox compute
+  # stack as String params with an "" default in Eval mode; the resources that
+  # consume them are gated Condition: IsProd, so the empty value is never used.
+  - W1030

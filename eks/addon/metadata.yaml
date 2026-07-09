@@ -1,0 +1,44 @@
+# Descriptor for the AWS Marketplace EKS add-on listing (Artifact A).
+# Consumed by scripts/build-addon.sh and the BuildKite publish stage. Values
+# here mirror what is entered in the AWS Marketplace Management Portal so the
+# listing and the packaged artifact never drift.
+
+addon:
+  # Marketplace add-on name. Public add-ons are referenced by AWS::EKS::Addon as
+  # "<publisher>_<name>" once published; kept in versions.env as ADDON_PRODUCT_NAME.
+  name: flyte-eks
+  displayName: "Flyte 2 for Amazon EKS"
+  publisher: "Union.ai"
+  # Semantic version of the add-on (== wrapper Chart.yaml version == ADDON_VERSION).
+  version: "0.1.0"
+
+  # The Flyte backend delivered by this version.
+  flyteVersion: "2.0.27"
+
+  description: >-
+    Production Flyte 2 control plane on Amazon EKS. Runs the flyte-binary
+    backend wired to external Aurora PostgreSQL and Amazon S3 via EKS Pod
+    Identity. Intended to be installed by the companion CloudFormation
+    full-stack product, which provisions the database, bucket, IAM, and ingress.
+
+  # Namespace the add-on installs into (must match PodIdentityAssociation).
+  namespace: flyte
+
+  # Pod Identity: the CloudFormation stack creates the role + association for
+  # this (namespace, serviceAccount) pair. Declared here for documentation and
+  # for validate.sh to cross-check against the chart's serviceAccount.name.
+  podIdentity:
+    serviceAccountName: flyte-backend
+    # Minimal S3 permissions the associated role must grant (scoped to the
+    # provisioned bucket in the CloudFormation template).
+    requiredS3Actions:
+      - s3:GetObject
+      - s3:PutObject
+      - s3:DeleteObject
+      - s3:ListBucket
+
+  configurationSchema: addon-configuration-schema.json
+
+  # Container images that must be relocated into the Marketplace-provisioned ECR
+  # at publish time (populated from the vendored chart by scripts/build-addon.sh).
+  images: []

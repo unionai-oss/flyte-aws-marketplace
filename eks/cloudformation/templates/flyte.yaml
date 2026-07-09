@@ -1,0 +1,254 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flyte 2 on EKS — install layer. A CodeBuild project runs scripts/bootstrap.sh
+  against the new cluster (DB secret, ALB controller, ACM/Route53, and the
+  add-on-vs-helm resolver). A WaitCondition blocks the stack until it signals.
+
+Parameters:
+  ClusterName: { Type: String }
+  RepoUrl:
+    Type: String
+    Description: Git repo containing the chart + scripts (this repo).
+  RepoRef:
+    Type: String
+    Default: main
+  Namespace: { Type: String, Default: flyte }
+  ServiceAccount: { Type: String, Default: flyte-backend }
+  DBSecretArn: { Type: String }
+  DBEndpoint: { Type: String }
+  DBPort: { Type: String, Default: "5432" }
+  DBName: { Type: String, Default: flyte }
+  DBUsername: { Type: String, Default: flyte }
+  BucketName: { Type: String }
+  FlyteS3RoleArn: { Type: String }
+  DomainName: { Type: String, Default: "" }
+  HostedZoneId: { Type: String, Default: "" }
+  CognitoIssuer: { Type: String, Default: "" }
+  CognitoClientId: { Type: String, Default: "" }
+  CognitoUserPoolArn: { Type: String, Default: "" }
+  CognitoDomainPrefix: { Type: String, Default: "" }
+  CognitoCliClientId: { Type: String, Default: "" }
+  BootstrapTimeout:
+    Type: String
+    Default: "3600"
+
+Resources:
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bootstrap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+              - Sid: Eks
+                Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:DescribeAddon
+                  - eks:DescribeAddonVersions
+                  - eks:CreateAddon
+                  - eks:ListAddons
+                  - eks:ListPodIdentityAssociations
+                  - eks:CreatePodIdentityAssociation
+                Resource: "*"
+              - Sid: Secret
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DBSecretArn
+              - Sid: AlbControllerIam
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:GetPolicy
+                  - iam:ListPolicies
+                  - iam:CreateRole
+                  - iam:GetRole
+                  - iam:AttachRolePolicy
+                  - iam:ListPolicyVersions
+                Resource: "*"
+              # CreatePodIdentityAssociation requires PassRole on the role being
+              # bound to the aws-load-balancer-controller service account.
+              - Sid: PassAlbControllerRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub "arn:aws:iam::${AWS::AccountId}:role/${ClusterName}-alb-controller"
+              - Sid: DnsAndCerts
+                Effect: Allow
+                Action:
+                  - acm:RequestCertificate
+                  - acm:DescribeCertificate
+                  - acm:ListCertificates
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetChange
+                  - route53:ListResourceRecordSets
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSecurityGroups
+                Resource: "*"
+
+  # Grant the CodeBuild role cluster-admin so it can install into the cluster.
+  ClusterAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref ClusterName
+      PrincipalArn: !GetAtt CodeBuildRole.Arn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  BootstrapProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ClusterName}-flyte-bootstrap"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - { Name: CLUSTER_NAME, Value: !Ref ClusterName }
+          - { Name: NAMESPACE, Value: !Ref Namespace }
+          - { Name: SERVICE_ACCOUNT, Value: !Ref ServiceAccount }
+          - { Name: DB_SECRET_ARN, Value: !Ref DBSecretArn }
+          - { Name: DB_HOST, Value: !Ref DBEndpoint }
+          - { Name: DB_PORT, Value: !Ref DBPort }
+          - { Name: DB_NAME, Value: !Ref DBName }
+          - { Name: DB_USER, Value: !Ref DBUsername }
+          - { Name: S3_BUCKET, Value: !Ref BucketName }
+          - { Name: FLYTE_S3_ROLE_ARN, Value: !Ref FlyteS3RoleArn }
+          - { Name: DOMAIN_NAME, Value: !Ref DomainName }
+          - { Name: HOSTED_ZONE_ID, Value: !Ref HostedZoneId }
+          - { Name: COGNITO_ISSUER, Value: !Ref CognitoIssuer }
+          - { Name: COGNITO_CLIENT_ID, Value: !Ref CognitoClientId }
+          - { Name: COGNITO_USER_POOL_ARN, Value: !Ref CognitoUserPoolArn }
+          - { Name: COGNITO_DOMAIN_PREFIX, Value: !Ref CognitoDomainPrefix }
+          - { Name: COGNITO_CLI_CLIENT_ID, Value: !Ref CognitoCliClientId }
+          - { Name: REPO_URL, Value: !Ref RepoUrl }
+          - { Name: REPO_REF, Value: !Ref RepoRef }
+          - { Name: SIGNAL_URL, Value: !Ref BootstrapWaitHandle }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - curl -sSL https://get.helm.sh/helm-v3.16.2-linux-amd64.tar.gz | tar xz && mv linux-amd64/helm /usr/local/bin/helm
+                - curl -sSLo /usr/local/bin/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl && chmod +x /usr/local/bin/kubectl
+            build:
+              commands:
+                - git clone --branch "$REPO_REF" --depth 1 "$REPO_URL" /src
+                - |
+                  # Always signal the WaitCondition, even if setup/bootstrap aborts,
+                  # so the stack fails fast instead of hanging until timeout. The
+                  # cd + chmod live INSIDE this guarded block on purpose: the eks
+                  # product is under eks/ in the monorepo, so a missing dir (e.g.
+                  # wrong RepoRef) must signal FAILURE, not abort the phase before
+                  # we ever reach signal(). bootstrap.sh derives REPO_ROOT from its
+                  # own path, so it must run from /src/eks.
+                  signal() {
+                    local status="$1"
+                    for attempt in 1 2 3 4 5; do
+                      code=$(curl -sS -o /tmp/sig.out -w '%{http_code}' -X PUT -H 'Content-Type:' \
+                        --data-binary "{\"Status\":\"$status\",\"Reason\":\"bootstrap $status (see CodeBuild log)\",\"UniqueId\":\"flyte-bootstrap\",\"Data\":\"done\"}" \
+                        "$SIGNAL_URL") && [ "$code" = 200 ] && { echo "signaled $status (http $code)"; return 0; }
+                      echo "signal attempt $attempt got http '$code'; retrying"; sleep 5
+                    done
+                    echo "WARNING: failed to signal $status"; return 0
+                  }
+                  set +e
+                  cd /src/eks && chmod +x scripts/*.sh && scripts/bootstrap.sh
+                  CODE=$?
+                  if [ $CODE -eq 0 ]; then signal SUCCESS; else signal FAILURE; fi
+                  exit $CODE
+
+  # Lambda custom resource that just starts the build on stack Create/Update.
+  StartBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt BootstrapProject.Arn
+
+  StartBuildFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt StartBuildRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref BootstrapProject
+      Code:
+        ZipFile: |
+          import os, boto3, urllib.request, json
+          def respond(event, status, reason=""):
+              body = json.dumps({
+                  "Status": status, "Reason": reason,
+                  "PhysicalResourceId": event.get("LogicalResourceId", "startbuild"),
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+              }).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, method="PUT",
+                                           headers={"Content-Type": ""})
+              urllib.request.urlopen(req)
+          def handler(event, context):
+              try:
+                  if event["RequestType"] in ("Create", "Update"):
+                      boto3.client("codebuild").start_build(projectName=os.environ["PROJECT_NAME"])
+                  respond(event, "SUCCESS")
+              except Exception as e:  # noqa
+                  respond(event, "FAILED", str(e))
+
+  StartBuild:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: ClusterAccessEntry
+    Properties:
+      ServiceToken: !GetAtt StartBuildFunction.Arn
+
+  BootstrapWaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  # Blocks stack completion until scripts/bootstrap.sh curls the signal URL.
+  BootstrapWait:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: StartBuild
+    Properties:
+      Handle: !Ref BootstrapWaitHandle
+      Timeout: !Ref BootstrapTimeout
+      Count: 1
+
+Outputs:
+  BootstrapProjectName:
+    Value: !Ref BootstrapProject

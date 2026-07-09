@@ -1,0 +1,629 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Single-EC2 Flyte devbox. Root stack: VPC + IAM instance profile + security
+  groups + the durable data volume/backup, and — in Prod mode (Domain set) — the
+  ECR registry and the shared common/{data,auth} substrate (S3 + Aurora + Cognito).
+  The EC2 host and its ALB front door live in the nested compute stack. Eval mode
+  (empty Domain) is a direct-EIP HTTP devbox with on-box storage; customers use
+  `insecure: true` in their flyte client config.
+
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    Description: >
+      CIDR for the VPC the stack creates. Must NOT overlap with the k3s pod CIDR
+      (10.42.0.0/16) or service CIDR (10.43.0.0/16), or in-cluster DNS will
+      route to flannel and break image pulls.
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    ConstraintDescription: Must be a CIDR like 1.2.3.4/32 or 10.0.0.0/16
+    Description: |
+      CIDR allowed to reach the devbox public ports (80 UI/API, 8081 serving, 5000 docker registry).
+      Use 1.2.3.4/32 for a single laptop, your corporate egress range (e.g. 10.0.0.0/16) for an office,
+      or 0.0.0.0/0 for open access (not recommended for production). To allow multiple ranges, deploy
+      with this set to your primary range and add additional SG ingress rules after launch.
+      In Prod mode (Domain set), this gates the ALB instead.
+      Ignored entirely if NoPublicIngress=Yes.
+
+  InstanceType:
+    Type: String
+    Default: m6i.2xlarge
+    Description: |
+      EC2 instance type for the devbox host. Default m6i.2xlarge = 8 vCPU / 32 GB RAM,
+      ~$9.20/day on-demand in us-east-1. The devbox runs k3s + Flyte + your
+      workloads; 2 vCPU machines (t3.large etc.) starve quickly under any real load.
+
+  DataVolumeSizeGb:
+    Type: Number
+    Default: 50
+
+  IdleThresholdMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 5
+
+  DevboxImage:
+    Type: String
+    Default: cr.flyte.org/flyteorg/flyte-devbox:latest
+
+  AmiId:
+    Type: String
+    Default: ""
+    Description: >-
+      Pin a specific Flyte devbox AMI ID. Leave blank to use the latest AMI
+      published by the build pipeline (resolved from AmiSsmParameter at deploy time).
+
+  AmiSsmParameter:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /flyte-devbox/ami/latest
+    Description: >-
+      SSM parameter holding the latest devbox AMI ID. The build pipeline
+      overwrites it on every devbox release, so deploys pick up new AMIs with no
+      template change. Resolved to an AMI ID at deploy time (the named parameter
+      must exist in this region).
+
+  # ---- Prod mode ----------------------------------------------------------
+  # Set Domain to a hostname you control to enable an ALB with HTTPS via ACM
+  # (cert auto-validated) and a Route 53 A record. The Route 53 hosted zone for
+  # the domain is discovered automatically (it must already exist in this
+  # account), so there is no zone id to look up. Eval mode (default, empty
+  # Domain) keeps the direct-EIP + auto-stop pattern.
+  Domain:
+    Type: String
+    Default: ""
+    Description: Optional. Hostname for HTTPS access (e.g. flyte.acme.com). When set, the stack enables Prod mode (ALB + ACM + Route 53) and auto-discovers the hosting Route 53 zone. When empty, Eval mode (direct EIP over HTTP) is used.
+
+  # ---- Private mode -------------------------------------------------------
+  # Set NoPublicIngress=Yes to suppress the EIP and the public SG ingress
+  # rules. The EC2 still has a public IP for outbound (Docker pulls) but
+  # nothing from the internet can reach it. Customer brings their own access
+  # (SSM Session Manager, Tailscale via cloud-init add-on, PrivateLink, etc.).
+  NoPublicIngress:
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes", "No"]
+    Description: When Yes, don't attach an EIP and don't open SG ingress to the world. Combine with Domain="" for a fully private deployment.
+
+  StableIp:
+    Type: String
+    Default: "Yes"
+    AllowedValues: ["Yes", "No"]
+    Description: |
+      When Yes, allocate an Elastic IP so the public hostname survives stop/start cycles
+      (costs ~$3.65/mo even when the EC2 is stopped). When No, the EC2 gets a fresh
+      auto-assigned public IP every time it starts; bookmarks and the stack outputs
+      go stale. Re-fetch the current hostname with the CLI snippet in the stack outputs.
+      Default No to keep idle cost ~$0. Ignored in Prod mode (ALB handles ingress).
+
+  AutoStop:
+    Type: String
+    Default: "Yes"
+    AllowedValues: ["Yes", "No"]
+    Description: |
+      When Yes, the EC2 auto-stops after IdleThresholdMinutes of no active Flyte
+      executions. In Eval mode the customer wakes it via the StartCli output. In
+      Prod mode (Domain set) the ALB hosts a Lambda wake-page that starts the EC2
+      and forwards once it's healthy — customers hit the same URL and wait.
+      Set No for always-on (recommended for serious Prod workloads).
+
+Conditions:
+  IsProd: !Not [!Equals [!Ref Domain, ""]]
+  HasAmiId: !Not [!Equals [!Ref AmiId, ""]]
+  WantsEvalPublic: !And
+    - !Equals [!Ref Domain, ""]
+    - !Equals [!Ref NoPublicIngress, "No"]
+  WantsEip: !And
+    - !Equals [!Ref Domain, ""]
+    - !Equals [!Ref NoPublicIngress, "No"]
+    - !Equals [!Ref StableIp, "Yes"]
+
+Resources:
+  # -------------------------------------------------------------------------
+  # Networking: one VPC, one public subnet (no HA — single EC2). Prod adds a
+  # second public subnet (ALB needs two AZs; the Aurora subnet group uses both).
+  # -------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-vpc"}]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-igw"}]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 1, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-public"}]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # We need TWO subnets across AZs for the ALB (and the Aurora subnet group).
+  # Add a second one only in Prod.
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: IsProd
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 2, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: !Sub "${AWS::StackName}-public-b"}]
+
+  PublicSubnetBAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: IsProd
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  # -------------------------------------------------------------------------
+  # IAM: EC2 instance role. Always-on policies: SSM + CloudWatch. The S3/ECR/
+  # secret/cognito access is attached only in Prod mode via ProdBackendPolicy.
+  # -------------------------------------------------------------------------
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: flyte-devbox-cloudwatch
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: {cloudwatch:namespace: FlyteDevbox}
+              # Self-attach the data volume at boot (no CFN attachment).
+              - Effect: Allow
+                Action: [ec2:AttachVolume, ec2:DescribeVolumes]
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref InstanceRole]}
+
+  # -------------------------------------------------------------------------
+  # SG: allow the devbox ports. Ingress rules are added separately so we can
+  # gate each on the relevant Condition: Eval mode opens to AllowedCidr; Prod
+  # mode only allows the ALB SG; Private mode opens nothing.
+  # -------------------------------------------------------------------------
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: Flyte devbox.
+
+  EvalIngressUi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WantsEvalPublic
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      CidrIp: !Ref AllowedCidr
+      Description: Flyte UI + gRPC
+
+  EvalIngressServing:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WantsEvalPublic
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      CidrIp: !Ref AllowedCidr
+      Description: flyte.App serving
+
+  EvalIngressRegistry:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WantsEvalPublic
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5000
+      ToPort: 5000
+      CidrIp: !Ref AllowedCidr
+      Description: Docker registry
+
+  # rustfs S3 NodePort — clients PUT bundles to signed URLs generated by
+  # dataproxy that point at <ec2-hostname>:30002. Required for laptop->remote
+  # `flyte run`; not needed if customer always runs Flyte CLI on the EC2.
+  EvalIngressRustfs:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: WantsEvalPublic
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 30002
+      ToPort: 30002
+      CidrIp: !Ref AllowedCidr
+      Description: rustfs S3 NodePort (signed URL target)
+
+  ProdIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsProd
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: From ALB only (to the devbox ingress; auth is enforced at the ALB)
+
+  # Public app serving: ALB -> Kourier gateway (:8081). Separate from :80 so app
+  # traffic skips the Cognito auth listener rules (apps are public).
+  ProdIngressAppsFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: IsProd
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8081
+      ToPort: 8081
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: From ALB only (to the Kourier app gateway)
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsProd
+    Properties:
+      VpcId: !Ref Vpc
+      GroupDescription: ALB ingress.
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCidr
+          Description: HTTPS
+
+  # -------------------------------------------------------------------------
+  # Dedicated EBS volume for /var/lib/docker. Survives EC2 replacement; daily
+  # AWS Backup snapshot with 7-day retention.
+  # -------------------------------------------------------------------------
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Size: !Ref DataVolumeSizeGb
+      VolumeType: gp3
+      Encrypted: true
+      Tags:
+        - {Key: Name, Value: !Sub "${AWS::StackName}-flyte-data"}
+        - {Key: flyte-devbox:backup, Value: "true"}
+
+  # -------------------------------------------------------------------------
+  # AWS Backup: daily snapshot of the data volume, 7-day retention.
+  # -------------------------------------------------------------------------
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties: {BackupVaultName: !Sub "${AWS::StackName}-flyte-data"}
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: backup.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub "${AWS::StackName}-flyte-data"
+        BackupPlanRule:
+          - RuleName: daily
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 5 ? * * *)
+            Lifecycle: {DeleteAfterDays: 7}
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: data-volume
+        IamRoleArn: !GetAtt BackupRole.Arn
+        ListOfTags:
+          - ConditionType: STRINGEQUALS
+            ConditionKey: flyte-devbox:backup
+            ConditionValue: "true"
+
+  # -------------------------------------------------------------------------
+  # Shared substrate (Prod mode only). S3 + Aurora + ECR and Cognito are the
+  # same templates the EKS product uses; the devbox passes its own values. The
+  # ECR (like the S3 bucket) is retained on teardown.
+  # -------------------------------------------------------------------------
+  CommonData:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsProd
+    Properties:
+      TemplateURL: ../../common/cloudformation/data.yaml
+      Parameters:
+        NamePrefix: !Sub "${AWS::StackName}-flyte"
+        VpcId: !Ref Vpc
+        SubnetIds: !Join [",", [!Ref PublicSubnet, !Ref PublicSubnetB]]
+        ClientSecurityGroupId: !Ref InstanceSecurityGroup
+        DBSecretName: !Sub "${AWS::StackName}-flyte-db"
+        EcrNamespace: !Sub "${AWS::StackName}-flyte"
+        DBMinCapacity: 0
+        DBMaxCapacity: 4
+        BackupRetentionPeriod: 7
+
+  CommonAuth:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsProd
+    Properties:
+      TemplateURL: ../../common/cloudformation/auth.yaml
+      Parameters:
+        NamePrefix: !Ref AWS::StackName
+        FlyteHost: !Ref Domain
+        CognitoDomainPrefix: !Sub "${AWS::StackName}-${AWS::AccountId}"
+        CliCallbackUrls: !Join
+          - ","
+          - - http://localhost:8080/callback
+            - http://localhost:8089/callback
+            - !Sub "https://${Domain}/callback"
+        ResourceServerIdentifier: !Sub "https://${Domain}"
+        ResourceServerScopeName: access
+        CreateM2MClient: "true"
+        IncludeApiScope: "true"
+
+  # -------------------------------------------------------------------------
+  # Prod-mode instance-role backend access: S3 + ECR + RDS secret + Cognito.
+  # References the shared stacks' outputs (bucket/secret/user-pool).
+  # -------------------------------------------------------------------------
+  ProdBackendPolicy:
+    Type: AWS::IAM::Policy
+    Condition: IsProd
+    Properties:
+      PolicyName: flyte-devbox-prod-backend
+      Roles: [!Ref InstanceRole]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource: !Sub "${CommonData.Outputs.BucketArn}/*"
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:GetBucketLocation
+            Resource: !GetAtt CommonData.Outputs.BucketArn
+          - Effect: Allow
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:InitiateLayerUpload
+              - ecr:UploadLayerPart
+              - ecr:CompleteLayerUpload
+              - ecr:PutImage
+              # Server-side/remote image builds push new image names; create-on-push
+              # auto-creates the repo, which requires this on the pushing identity.
+              - ecr:CreateRepository
+            Resource: "*"
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !GetAtt CommonData.Outputs.DBSecretArn
+          - Effect: Allow
+            Action:
+              # Fetch the confidential (console) client secret at boot. Hosted-UI
+              # branding is applied by the shared auth stack, not the box.
+              - cognito-idp:DescribeUserPoolClient
+            Resource: !GetAtt CommonAuth.Outputs.UserPoolArn
+
+  # -------------------------------------------------------------------------
+  # Compute: the EC2 host + ALB front door. Backend wiring is pre-resolved here
+  # and passed as flat parameters (the compute template never sees the common
+  # stacks). "none"/defaults outside Prod mode.
+  # -------------------------------------------------------------------------
+  Compute:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: templates/compute.yaml
+      Parameters:
+        Domain: !Ref Domain
+        RootStackName: !Ref AWS::StackName
+        InstanceType: !Ref InstanceType
+        IdleThresholdMinutes: !Ref IdleThresholdMinutes
+        DevboxImage: !Ref DevboxImage
+        ImageId: !If [HasAmiId, !Ref AmiId, !Ref AmiSsmParameter]
+        NoPublicIngress: !Ref NoPublicIngress
+        StableIp: !Ref StableIp
+        AutoStop: !Ref AutoStop
+        VpcId: !Ref Vpc
+        PublicSubnetId: !Ref PublicSubnet
+        PublicSubnetBId: !If [IsProd, !Ref PublicSubnetB, ""]
+        InstanceSecurityGroupId: !Ref InstanceSecurityGroup
+        AlbSecurityGroupId: !If [IsProd, !Ref AlbSecurityGroup, ""]
+        InstanceProfileArn: !GetAtt InstanceProfile.Arn
+        DataVolumeId: !Ref DataVolume
+        ProdMode: !If [IsProd, "1", "0"]
+        BucketName: !If [IsProd, !GetAtt CommonData.Outputs.BucketName, "none"]
+        DbHost: !If [IsProd, !GetAtt CommonData.Outputs.DBEndpoint, "none"]
+        DbPort: !If [IsProd, !GetAtt CommonData.Outputs.DBPort, "5432"]
+        DbSecretArn: !If [IsProd, !GetAtt CommonData.Outputs.DBSecretArn, "none"]
+        FlyteDomain: !If [IsProd, !Ref Domain, "none"]
+        CognitoIssuer: !If [IsProd, !GetAtt CommonAuth.Outputs.Issuer, "none"]
+        CognitoPkceClientId: !If [IsProd, !GetAtt CommonAuth.Outputs.CliClientId, "none"]
+        CognitoDomain: !If [IsProd, !GetAtt CommonAuth.Outputs.CognitoDomain, "none"]
+        CognitoWebClientId: !If [IsProd, !GetAtt CommonAuth.Outputs.UserPoolClientId, "none"]
+        CognitoPoolId: !If [IsProd, !GetAtt CommonAuth.Outputs.UserPoolId, "none"]
+        CognitoUserPoolArn: !If [IsProd, !GetAtt CommonAuth.Outputs.UserPoolArn, "none"]
+        CognitoDomainPrefix: !If [IsProd, !Sub "${AWS::StackName}-${AWS::AccountId}", "none"]
+
+Outputs:
+  # ---- Eval mode outputs (Eval+Public) ------------------------------------
+  # We output the AWS-provided EC2 public DNS hostname (ec2-<dashed-eip>.<region-domain>)
+  # rather than the raw EIP. Corporate web filters frequently allowlist
+  # *.amazonaws.com but block raw IPs on non-standard ports; the DNS form
+  # works in both cases. The hostname tracks the EIP (no DNS update on
+  # stop/start) so customer bookmarks stay valid.
+  UiUrlEval:
+    Condition: WantsEvalPublic
+    Description: Flyte UI (Eval mode). EC2 must be running.
+    Value: !Sub "http://${Compute.Outputs.InstancePublicDnsName}/v2"
+
+  ServingUrlEval:
+    Condition: WantsEvalPublic
+    Description: Internal apps ingress (Eval mode).
+    Value: !Sub "http://${Compute.Outputs.InstancePublicDnsName}:8081"
+
+  RegistryEndpointEval:
+    Condition: WantsEvalPublic
+    Description: Docker registry host:port (Eval mode). Use --insecure-registry on the docker daemon.
+    Value: !Sub "${Compute.Outputs.InstancePublicDnsName}:5000"
+
+  FlyteCliEndpointEval:
+    Condition: WantsEvalPublic
+    Description: Endpoint for `flyte create config --endpoint <this> --insecure` (Eval mode).
+    Value: !Sub "${Compute.Outputs.InstancePublicDnsName}:80"
+
+  EipEval:
+    Condition: WantsEip
+    Description: The Elastic IP (only when StableIp=Yes). For SG allowlists elsewhere; prefer the DNS hostname for actual access.
+    Value: !GetAtt Compute.Outputs.EipAddress
+
+  HostnameRefreshCli:
+    Condition: WantsEvalPublic
+    Description: |
+      When StableIp=No, the EC2 gets a fresh public hostname on every start. Run this command
+      after starting the EC2 to fetch the current hostname (the stack output URLs go stale).
+    Value: !Sub "aws ec2 describe-instances --filters Name=tag:Name,Values=${AWS::StackName} Name=instance-state-name,Values=running --query 'Reservations[].Instances[].PublicDnsName' --output text"
+
+  # ---- Prod mode outputs (HTTPS via Domain + backend stubs) ---------------
+  UiUrlProd:
+    Condition: IsProd
+    Description: Flyte UI (Prod mode), HTTPS via Domain.
+    Value: !Sub "https://${Domain}/v2"
+
+  AppsUrlProd:
+    Condition: IsProd
+    Description: >-
+      Public app serving base (Prod mode). Deployed flyte.App endpoints resolve to
+      <app-name>.apps.<Domain> over HTTPS. Apps are public and do NOT wake a
+      stopped EC2. Set the image registry to the stack ECR so the cluster can pull.
+    Value: !Sub "https://<app-name>.apps.${Domain}"
+
+  FlyteCliEndpointProd:
+    Condition: IsProd
+    Description: Endpoint for `flyte create config --endpoint <this>` (Prod mode; TLS by default — drop --insecure).
+    Value: !Ref Domain
+
+  ClientConfigProd:
+    Condition: IsProd
+    Description: Configure the flyte CLI for Cognito SSO — first run opens a browser PKCE login.
+    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type pkce"
+
+  CognitoUserPoolId:
+    Condition: IsProd
+    Description: Cognito user pool — create login users here, e.g. `aws cognito-idp admin-create-user --user-pool-id <this> --username you@example.com`.
+    Value: !GetAtt CommonAuth.Outputs.UserPoolId
+
+  CognitoM2MClientId:
+    Condition: IsProd
+    Description: M2M (CI) client id. Get its secret via `aws cognito-idp describe-user-pool-client --user-pool-id <UserPoolId> --client-id <this>`, then client-credentials against the hosted domain /oauth2/token (scope https://<domain>/access).
+    Value: !GetAtt CommonAuth.Outputs.M2MClientId
+
+  ProdDbEndpoint:
+    Condition: IsProd
+    Description: Aurora Serverless v2 (PostgreSQL) cluster endpoint for the Flyte runs DB (auto-wired in Prod mode).
+    Value: !Sub "${CommonData.Outputs.DBEndpoint}:${CommonData.Outputs.DBPort}"
+
+  ProdDbSecretArn:
+    Condition: IsProd
+    Description: ARN of the Secrets Manager secret holding the Aurora master password.
+    Value: !GetAtt CommonData.Outputs.DBSecretArn
+
+  ProdImageRegistry:
+    Condition: IsProd
+    Description: >-
+      ECR registry namespace for Flyte task images. Any image name auto-creates on
+      push (create-on-push), so no per-image repo setup.
+    Value: !GetAtt CommonData.Outputs.EcrRegistry
+
+  ImageRegistryConfig:
+    Condition: IsProd
+    Description: >-
+      One-shot CLI config so SDK image builds push to this stack's ECR. Any image
+      name works (repos auto-create on push). The --registry flag needs a flyte SDK
+      with flyteorg/flyte-sdk#1278; otherwise set `image.registry` in the config.
+    Value: !Sub "flyte create config --endpoint dns:///${Domain}:443 --auth-type pkce --registry ${CommonData.Outputs.EcrRegistry}"
+
+  # ---- Always-on outputs --------------------------------------------------
+  InstanceId:
+    Description: EC2 instance ID.
+    Value: !GetAtt Compute.Outputs.InstanceId
+
+  BucketName:
+    Condition: IsProd
+    Description: S3 bucket auto-wired as the Prod-mode object store.
+    Value: !GetAtt CommonData.Outputs.BucketName
+
+  StartCli:
+    Description: Start the EC2 from the CLI without knowing the instance ID.
+    Value: !Sub "aws ec2 start-instances --instance-ids $(aws ec2 describe-instances --filters Name=tag:Name,Values=${AWS::StackName} Name=instance-state-name,Values=stopped --query Reservations[].Instances[].InstanceId --output text)"
+
+  StopCli:
+    Description: Stop the EC2 on demand.
+    Value: !Sub "aws ec2 stop-instances --instance-ids $(aws ec2 describe-instances --filters Name=tag:Name,Values=${AWS::StackName} Name=instance-state-name,Values=running --query Reservations[].Instances[].InstanceId --output text)"

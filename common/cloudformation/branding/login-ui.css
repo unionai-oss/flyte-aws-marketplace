@@ -1,0 +1,11 @@
+/* Union/Flyte brand — Cognito Hosted UI (light theme, purple accents).
+   Only Cognito-allowed selectors/properties; see docs/brand-palette.md. */
+.background-customizable { background-color: #F5F6F8; }          /* grey-95 page */
+.banner-customizable { background-color: #FCFDFD; }             /* grey-99 banner (on-light logo) */
+.logo-customizable { max-width: 220px; max-height: 90px; }
+.label-customizable { color: #1D1E1F; }                        /* grey-10 text */
+.textDescription-customizable { color: #434648; }              /* grey-30 */
+.inputField-customizable { border-color: #B1B5B7; }            /* grey-60 */
+.inputField-customizable:focus { border-color: #6F43C0; }      /* purple-50 */
+.submitButton-customizable { background-color: #6F43C0; }      /* purple-50 primary */
+.submitButton-customizable:hover { background-color: #5A32A4; }/* purple-40 hover */

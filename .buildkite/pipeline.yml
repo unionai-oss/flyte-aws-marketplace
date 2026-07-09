@@ -1,0 +1,14 @@
+# Buildkite entry point for the flyte-aws-marketplace monorepo.
+#
+# One dynamic step generates the real pipeline from the paths that changed:
+#   • a change under common/**        -> re-validate BOTH products
+#   • a change under devbox/**        -> validate devbox
+#   • a change under eks/**           -> validate eks
+#   • repo-wide files (scripts/, .buildkite/, .cfnlintrc) -> validate both
+# On `main` it also runs the devbox AMI release-check (build -> smoke -> publish
+# when a new devbox image ships). See .buildkite/generate.sh.
+steps:
+  - label: ":pipeline: generate"
+    command: ".buildkite/generate.sh | buildkite-agent pipeline upload"
+    agents:
+      queue: "default"

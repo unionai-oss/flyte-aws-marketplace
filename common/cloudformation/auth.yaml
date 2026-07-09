@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Flyte 2 shared auth substrate. Cognito user pool + hosted-UI domain + resource
+  server + OAuth2 clients for the ALB-native auth model both products use: a
+  confidential "console" client driven by ALB authenticate-cognito, a public PKCE
+  "cli" client, and an optional machine-to-machine client for CI. Every value that
+  differs between the devbox and EKS products is a Parameter/Condition set by the
+  product's root.yaml — no product-specific conditionals are hard-coded here.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for the user pool and client names.
+  FlyteHost:
+    Type: String
+    Description: >-
+      Fully-qualified host Flyte is served at (devbox passes <domain>, EKS passes
+      flyte.<domain>). The console client callback is https://<FlyteHost>/oauth2/idpresponse.
+  CognitoDomainPrefix:
+    Type: String
+    Description: Globally-unique prefix for the Cognito hosted-UI domain.
+  CliCallbackUrls:
+    Type: CommaDelimitedList
+    Default: "http://localhost:53593/callback"
+    Description: >-
+      Callback URLs for the public PKCE (cli) client. Default is the flyte SDK
+      default port. The devbox passes its own list (localhost:8089 etc.).
+  ResourceServerIdentifier:
+    Type: String
+    Default: "https://flyte"
+    Description: OAuth2 resource-server identifier. The custom API scope is <Identifier>/<ScopeName>.
+  ResourceServerScopeName:
+    Type: String
+    Default: "all"
+    Description: Resource-server scope name.
+  CreateM2MClient:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Create a client_credentials (M2M) client — devbox uses it for CI, EKS does not.
+  IncludeApiScope:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      When true, the console and cli clients also request the custom resource-server
+      scope and carry a logout URL (devbox behaviour). EKS leaves this false.
+
+Conditions:
+  WantM2M: !Equals [!Ref CreateM2MClient, "true"]
+  WantApiScope: !Equals [!Ref IncludeApiScope, "true"]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${NamePrefix}-flyte"
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  UserPoolResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Ref ResourceServerIdentifier
+      Name: flyte
+      Scopes:
+        - ScopeName: !Ref ResourceServerScopeName
+          ScopeDescription: Full Flyte access
+
+  # Confidential client for the browser flow: ALB `authenticate-cognito` uses it
+  # to run the console SSO login. Its callback is ALB's fixed /oauth2/idpresponse.
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: UserPoolResourceServer
+    Properties:
+      ClientName: !Sub "${NamePrefix}-console"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes: !If
+        - WantApiScope
+        - [openid, email, profile, !Sub "${ResourceServerIdentifier}/${ResourceServerScopeName}"]
+        - [openid, email, profile]
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - !Sub "https://${FlyteHost}/oauth2/idpresponse"
+      LogoutURLs:
+        - !Sub "https://${FlyteHost}/logout"
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  # Public (no-secret) PKCE client for the SDK/CLI. The API is protected by ALB
+  # JWT validation, which accepts a valid Cognito token from any client; this one
+  # lets the SDK do an interactive PKCE login.
+  UserPoolClientCli:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: UserPoolResourceServer
+    Properties:
+      ClientName: !Sub "${NamePrefix}-cli"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes: !If
+        - WantApiScope
+        - [openid, email, profile, !Sub "${ResourceServerIdentifier}/${ResourceServerScopeName}"]
+        - [openid, email, profile]
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs: !Ref CliCallbackUrls
+      LogoutURLs: !If
+        - WantApiScope
+        - [!Sub "https://${FlyteHost}/logout"]
+        - !Ref "AWS::NoValue"
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+
+  # ---- Hosted-UI branding (logo + colour scheme) ----
+  # CloudFormation's native UICustomizationAttachment only does CSS, not the logo
+  # image, so a tiny custom resource calls SetUICustomization for both. The assets
+  # (login-ui.css + login-logo.png) are bundled beside the handler and uploaded by
+  # `aws cloudformation package`. This lives in the shared auth stack so every
+  # product's login page is branded identically.
+  BrandingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: set-ui-customization
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:SetUICustomization
+                Resource: !GetAtt UserPool.Arn
+
+  BrandingFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt BrandingRole.Arn
+      Code: branding
+
+  # Applying UI customization needs the hosted-UI domain to exist first.
+  LoginBranding:
+    Type: Custom::CognitoLoginBranding
+    DependsOn: UserPoolDomain
+    Properties:
+      ServiceToken: !GetAtt BrandingFn.Arn
+      UserPoolId: !Ref UserPool
+
+  # Machine-to-machine client for CI (client-credentials). Optional.
+  UserPoolClientM2M:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: WantM2M
+    DependsOn: UserPoolResourceServer
+    Properties:
+      ClientName: !Sub "${NamePrefix}-m2m"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub "${ResourceServerIdentifier}/${ResourceServerScopeName}"
+      SupportedIdentityProviders:
+        - COGNITO
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+  UserPoolClientId:
+    Description: Confidential client id used by ALB authenticate-cognito.
+    Value: !Ref UserPoolClient
+  CliClientId:
+    Description: Public PKCE client id for the SDK/CLI.
+    Value: !Ref UserPoolClientCli
+  M2MClientId:
+    Condition: WantM2M
+    Description: client_credentials client id for CI.
+    Value: !Ref UserPoolClientM2M
+  CognitoDomainPrefix:
+    Value: !Ref CognitoDomainPrefix
+  CognitoDomain:
+    Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  Issuer:
+    Description: OIDC issuer / JWT iss; JWKS is <issuer>/.well-known/jwks.json.
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"

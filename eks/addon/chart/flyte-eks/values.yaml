@@ -1,0 +1,101 @@
+# ============================================================================
+# flyte-eks wrapper — STABLE defaults for the EKS add-on.
+#
+# Everything here is a fixed, EKS-native default. Per-deployment values (Aurora
+# endpoint, S3 bucket, region, ingress host, cert/Cognito ARNs) are supplied at
+# install time by CloudFormation via the add-on `configurationValues`, or by
+# scripts/render-config.sh for the helm-fallback path. Both merge ON TOP of the
+# keys below, so the two install paths are byte-equivalent.
+#
+# All keys are namespaced under `flyte-binary:` because it is a subchart — that
+# is exactly the shape the add-on configurationValues must take, since EKS
+# merges the blob straight into the packaged chart's values.
+# ============================================================================
+
+flyte-binary:
+  # Data offload prefix for the unified Flyte manager. Set per-deploy to
+  # s3://<provisioned-bucket> (see render-config.sh / configurationValues).
+  flyte-core-components:
+    runs:
+      storagePrefix: ""
+
+  # ---- Object store: S3 via EKS Pod Identity (no static keys) --------------
+  configuration:
+    storage:
+      provider: s3
+      # metadataContainer is the only container key in flyte-binary v2 (there is
+      # no userDataContainer). Set per-deploy from the provisioned bucket name.
+      metadataContainer: ""
+      providerConfig:
+        s3:
+          # `iam` = use the pod's ambient credentials (Pod Identity role).
+          # No accessKey/secretKey — those must never be set.
+          authType: iam
+          region: ""          # per-deploy (e.g. us-east-1)
+
+    # ---- External Aurora Serverless v2 (PostgreSQL) ------------------------
+    # v2 reads the connection from configuration.database.postgres.* — the flat
+    # configuration.database.* keys used by flyte-binary v1 are ignored here.
+    database:
+      postgres:
+        username: flyte
+        dbname: flyte
+        host: ""              # per-deploy: Aurora cluster writer endpoint
+        port: 5432
+        # Password is NOT inlined. It is mounted from a Kubernetes Secret the
+        # CloudFormation bootstrap creates (synced from Secrets Manager) and read
+        # via passwordPath. Leave `password` unset so the chart creates no Secret.
+        passwordPath: /etc/db/secret/password
+        options: "sslmode=require"
+
+    # Extra backend config merged into the generated Flyte config.
+    inline:
+      executor:
+        # Task pods run under a dedicated, S3-only service account (created by
+        # bootstrap.sh and bound to the S3 role via EKS Pod Identity — see
+        # cloudformation/iam.yaml). Without this, tasks fall to the namespace
+        # `default` SA, which has no bucket credentials, and every task hangs
+        # ~144s on IMDS before failing. (Flyte v2 install docs, step 4.)
+        defaultK8sServiceAccount: flyte-task
+
+  # ---- Service account bound to the S3 IAM role via PodIdentityAssociation --
+  # The name is FIXED so the CloudFormation AWS::EKS::PodIdentityAssociation can
+  # reference (namespace=flyte, serviceAccount=flyte-backend) deterministically.
+  serviceAccount:
+    create: true
+    name: flyte-backend
+    # No IRSA annotation needed: EKS Pod Identity binds the role out-of-band.
+    annotations: {}
+
+  # ---- Ingress: AWS Load Balancer Controller (ALB) -------------------------
+  # `create` and host/annotations are turned on per-deploy only in prod mode
+  # (custom domain). Dev mode leaves ingress off and uses port-forward / NLB.
+  ingress:
+    create: false
+    ingressClassName: alb
+    separateGrpcIngress: true
+    host: ""                  # per-deploy: flyte.<domain>
+
+  # ---- Mount the DB password secret into the backend pod -------------------
+  # NOTE: exact key names for extra volumes are verified in scripts/validate.sh
+  # against the vendored chart. The secret `flyte-db-credentials` is created by
+  # the CloudFormation bootstrap custom resource before the add-on installs.
+  deployment:
+    extraVolumes:
+      - name: db-secret
+        secret:
+          secretName: flyte-db-credentials
+    extraVolumeMounts:
+      - name: db-secret
+        mountPath: /etc/db/secret
+        readOnly: true
+
+  # Reasonable production-lean defaults; overridable per-deploy.
+  replicaCount: 2
+  resources:
+    limits:
+      cpu: 2
+      memory: 4Gi
+    requests:
+      cpu: 500m
+      memory: 1Gi
