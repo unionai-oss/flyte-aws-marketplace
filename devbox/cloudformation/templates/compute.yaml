@@ -404,6 +404,17 @@ Resources:
                   - elasticloadbalancing:DescribeRules
                   - elasticloadbalancing:ModifyRule
                 Resource: "*"
+              # ModifyRule on a rule carrying an authenticate-cognito action makes
+              # ELB validate the user pool client AS THE CALLER, so the flip needs
+              # this or it fails with InvalidLoadBalancerAction. Only in Prod-wake
+              # mode: elsewhere CognitoUserPoolArn is "none" (not a valid ARN) and
+              # the lambda never flips, so the statement is dropped entirely.
+              - !If
+                - WantsProdWake
+                - Effect: Allow
+                  Action: cognito-idp:DescribeUserPoolClient
+                  Resource: !Ref CognitoUserPoolArn
+                - !Ref AWS::NoValue
 
   StopLambda:
     Condition: WantsAutoStop
@@ -456,8 +467,16 @@ Resources:
               log.info("auth rules flipped to wake-tg")
 
           def lambda_handler(event, _ctx):
+              # The flip must never block the stop: a raising _flip_to_wake() used
+              # to abort the handler before StopInstances, so the box billed
+              # indefinitely. Worst case here is a stopped box whose rules still
+              # point at the (now empty) devbox tg -- callers get 5xx instead of a
+              # wake, which beats never stopping. The next wake repairs the rules.
               if FLIP_RULES:
-                  _flip_to_wake()
+                  try:
+                      _flip_to_wake()
+                  except Exception:
+                      log.exception("flip to wake-tg failed; stopping anyway")
               ec2.stop_instances(InstanceIds=[INSTANCE_ID])
               log.info("StopInstances issued for %s", INSTANCE_ID)
 
@@ -800,6 +819,12 @@ Resources:
                   - elasticloadbalancing:DescribeRules
                   - elasticloadbalancing:ModifyRule
                 Resource: "*"
+              # _flip_to_ec2 rewrites the same authenticate-cognito rules the stop
+              # lambda flips, so it needs the same grant (see StopLambdaRole). This
+              # role only exists under WantsProdWake, where the ARN is always real.
+              - Effect: Allow
+                Action: cognito-idp:DescribeUserPoolClient
+                Resource: !Ref CognitoUserPoolArn
 
   WakeLambda:
     Type: AWS::Lambda::Function
