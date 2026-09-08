@@ -132,12 +132,19 @@ echo "${RENDERED}" | grep -qE "^  name: .*[A-Z]" \
 
 echo "== 6. Marketplace EKS add-on packaging rules =="
 
-# 6a. The two files AWS reads at ingestion, by exact name, at the chart top level.
-for f in aws_mp_configuration_schema.json aws_mp_addon_parameters.json; do
-  [[ -f "${CHART_DIR}/${f}" ]] || fail "${f} missing from the chart top level"
-  python3 -m json.tool "${CHART_DIR}/${f}" >/dev/null \
-    || fail "${f} is not valid JSON"
-done
+# 6a. The file AWS reads at ingestion, by exact name, at the chart top level.
+[[ -f "${CHART_DIR}/aws_mp_configuration_schema.json" ]] \
+  || fail "aws_mp_configuration_schema.json missing from the chart top level"
+python3 -m json.tool "${CHART_DIR}/aws_mp_configuration_schema.json" >/dev/null \
+  || fail "aws_mp_configuration_schema.json is not valid JSON"
+
+# aws_mp_addon_parameters.json is deliberately ABSENT. Submitting it with an
+# empty managedPolicies list was rejected with "Invalid Permissions List", and
+# the only AWS-managed policy that functionally fits (AmazonS3FullAccess) grants
+# account-wide S3, against the least-privilege requirement. See
+# addon/chart/flyte-eks-add-on/README.md before adding it back.
+[[ ! -f "${CHART_DIR}/aws_mp_addon_parameters.json" ]] \
+  || fail "aws_mp_addon_parameters.json is back — see the chart README before shipping it"
 
 # 6b. Schema draft must be one EKS accepts; anything else blocks release with
 # INCOMPATIBLE_CONFIGURATION_SCHEMA_VERSION.
@@ -202,10 +209,9 @@ PY
 # 6c. Pod Identity declaration must name the same SA the chart creates and the
 # CloudFormation PodIdentityAssociation binds.
 SA_IN_CHART="$(grep -A3 '^  serviceAccount:' "${CHART_DIR}/values.yaml" | awk '/name:/{print $2; exit}')"
-SA_IN_PARAMS="$(python3 -c "import json;print(json.load(open('${CHART_DIR}/aws_mp_addon_parameters.json'))['permissions']['permissionsList'][0]['serviceAccount'])")"
 SA_IN_META="$(awk '/serviceAccountName:/{print $2; exit}' "${METADATA}")"
-[[ "${SA_IN_CHART}" == "${SA_IN_PARAMS}" && "${SA_IN_CHART}" == "${SA_IN_META}" ]] \
-  || fail "serviceAccount mismatch: chart=${SA_IN_CHART} params=${SA_IN_PARAMS} metadata=${SA_IN_META}"
+[[ "${SA_IN_CHART}" == "${SA_IN_META}" ]] \
+  || fail "serviceAccount mismatch: chart=${SA_IN_CHART} metadata=${SA_IN_META}"
 grep -A3 '^  serviceAccount:' "${CHART_DIR}/values.yaml" | grep -q "create: true" \
   || fail "serviceAccount.create must be true (a console-installed add-on attaches IAM to it)"
 

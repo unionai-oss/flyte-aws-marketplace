@@ -14,7 +14,7 @@ addon:
   publisher: "Union.ai"
   # Semantic version of the add-on (== wrapper Chart.yaml version == ADDON_VERSION).
   # The portal wants major.minor.patch with no leading "v".
-  version: "0.1.1"
+  version: "0.1.2"
 
   # Add-on category, chosen from the fixed list Marketplace allows for EKS
   # add-on products. Flyte is a workflow orchestrator rather than a cluster
@@ -57,10 +57,9 @@ addon:
   # Both files live at the top level of the chart, where the add-on framework
   # reads them by these exact names. See addon/chart/flyte-eks-add-on/README.md.
   configurationSchema: chart/flyte-eks-add-on/aws_mp_configuration_schema.json
-  addonParameters: chart/flyte-eks-add-on/aws_mp_addon_parameters.json
 
   # The chart itself, pushed as an OCI artifact by scripts/build-addon.sh.
-  helmChartUri: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:0.1.1
+  helmChartUri: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:0.1.2
 
   # Every container image the chart renders, after relocation into the
   # Marketplace ECR. This list is entered verbatim in the Add Version request —

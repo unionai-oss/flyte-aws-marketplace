@@ -9,7 +9,7 @@ description: >-
 type: application
 
 # Wrapper chart version. Keep in lockstep with ADDON_VERSION in versions.env.
-version: 0.1.1
+version: 0.1.2
 
 # The Flyte backend version this add-on delivers (flyte-binary appVersion).
 appVersion: "2.0.27"

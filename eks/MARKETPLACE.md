@@ -76,11 +76,12 @@ never be corrected or removed; it can only be abandoned and replaced by the next
 skipped (re-running is a no-op) and a tag holding the wrong content fails with
 instructions to bump the revision.
 
-> Chart tag `0.1.0` is likewise **abandoned** — it was the first submission, which
-> failed ingestion on `.Release.Service` and on templating with default values.
-> Both are fixed in `0.1.1`. This is why the chart version and `ADDON_VERSION`
-> jumped without any change to the Flyte release: a rejected chart still burns
-> its tag.
+> Chart tags `0.1.0` and `0.1.1` are likewise **abandoned** — it was the first submission, which
+> failed ingestion on `.Release.Service` and on templating with default values;
+> `0.1.1` fixed those and was then rejected on `aws_mp_addon_parameters.json`.
+> This is why the chart version and `ADDON_VERSION` keep moving without any
+> change to the Flyte release: a rejected chart still burns its tag, so budget
+> one version per submission attempt.
 >
 > `union-ai/flyte-eks-add-on:flyte-binary-v2.0.27` (no suffix) is **abandoned**.
 > An earlier build copied the full index and then tried to filter it in place,
@@ -98,10 +99,13 @@ Two things are **not** settled and need a human before submission:
    or Amazon EKS". Flyte is a workflow orchestrator — an application, not a
    cluster component. `addon/metadata.yaml` provisionally sets
    `kubernetes-management`. Confirm with Marketplace ops before submitting.
-2. **`aws_mp_addon_parameters.json` `managedPolicies` is empty.** See
-   [addon/chart/flyte-eks-add-on/README.md](addon/chart/flyte-eks-add-on/README.md)
-   for why (the S3 policy is bucket-scoped and per-deployment; the only managed
-   policy that would cover it grants account-wide S3).
+2. **There is no `aws_mp_addon_parameters.json`.** Shipping it with an empty
+   `managedPolicies` was rejected (*Invalid Permissions List*), and the only
+   AWS-managed policy that fits grants account-wide S3. The file is omitted, at
+   the cost of the console's Add-on access section. See
+   [addon/chart/flyte-eks-add-on/README.md](addon/chart/flyte-eks-add-on/README.md).
+   Marketplace Seller Operations can confirm the expected shape for a
+   bucket-scoped, caller-supplied role.
 
 Also note: BYOL pricing is not supported for EKS add-on delivery, and the
 container product must already be published before the add-on delivery option
