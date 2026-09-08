@@ -65,13 +65,33 @@ else
     dst="${MARKETPLACE_ECR}:${row##*|}"
     echo "   ${src}"
     echo "     -> ${dst}"
-    # Copy the whole index (all platforms, all referrers), then rewrite the
-    # index in place keeping only the two required platforms. That second pass
-    # drops the in-toto attestation manifests that every buildx-built image
-    # carries as `unknown/unknown` children — Marketplace's security scan
-    # rejects them as "layers with unsupported architectures".
-    crane copy "${src}" "${dst}"
-    crane index filter "${dst}" \
+
+    # Marketplace ECR tags are IMMUTABLE and sellers hold no
+    # ecr:BatchDeleteImage, so a tag can be written exactly once. Check first:
+    # re-running the script must be a no-op, and a tag holding the wrong
+    # content has to be abandoned for a new -rN revision rather than fixed.
+    if existing="$(crane manifest "${dst}" 2>/dev/null)"; then
+      have="$(echo "${existing}" | jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | sort | join(",")')"
+      if [[ "${have}" == "linux/amd64,linux/arm64" ]]; then
+        echo "     already present and correct — skipping"
+        continue
+      fi
+      echo "     FAIL: ${dst} already exists with platforms [${have}]." >&2
+      echo "           Marketplace ECR tags are immutable and cannot be deleted." >&2
+      echo "           Bump the -rN suffix for this row in versions.env (and in" >&2
+      echo "           values.yaml + metadata.yaml) and re-run." >&2
+      exit 1
+    fi
+
+    # Filter, THEN push — one operation, straight to the final tag. Copying the
+    # full index first and rewriting it in place would need two writes to the
+    # same tag, which an immutable repository refuses on the second.
+    #
+    # Keeping only the two required platforms also drops the in-toto attestation
+    # manifests that every buildx-built image carries as `unknown/unknown` —
+    # Marketplace's security scan rejects them as "layers with unsupported
+    # architectures".
+    crane index filter "${src}" \
       --platform linux/amd64 --platform linux/arm64 \
       -t "${dst}"
 

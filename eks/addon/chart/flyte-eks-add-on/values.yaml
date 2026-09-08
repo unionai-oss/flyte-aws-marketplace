@@ -34,12 +34,12 @@ flyteBinary:
   deployment:
     image:
       repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-      tag: flyte-binary-v2.0.27
+      tag: flyte-binary-v2.0.27-r1
     # initContainer that waits for Aurora to accept connections.
     waitForDB:
       image:
         repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-        tag: postgres-15-alpine
+        tag: postgres-15-alpine-r1
 
     # ---- Mount the DB password secret into the backend pod ----------------
     # NOTE: exact key names for extra volumes are verified in scripts/validate.sh
@@ -60,13 +60,13 @@ flyteBinary:
   console:
     image:
       repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-      tag: flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088
+      tag: flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088-r1
 
   # Connector service (nested subchart of flyte-binary).
   flyteconnector:
     image:
       repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-      tag: flyte-connectors-py3.12-v2.3.6
+      tag: flyte-connectors-py3.12-v2.3.6-r1
 
   # Data offload prefix for the unified Flyte manager. Set per-deploy to
   # s3://<provisioned-bucket> (see render-config.sh / configurationValues).
@@ -80,7 +80,7 @@ flyteBinary:
     co-pilot:
       image:
         repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-        tag: flyte-binary-v2.0.27
+        tag: flyte-binary-v2.0.27-r1
 
     storage:
       provider: s3

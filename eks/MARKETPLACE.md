@@ -63,6 +63,23 @@ in a review cycle. The non-obvious ones:
 | Chart must contain a Deployment or DaemonSet | It does; the framework tracks add-on rollout through it. |
 | `helm lint` / `helm template` must pass at **helm 3.19** | `HELM_MIN_VERSION` in `versions.env`; `build-addon.sh` refuses to publish below it and `validate.sh` warns. |
 
+### Marketplace ECR tags are immutable
+
+A tag can be written exactly once. Sellers hold `GetAuthorizationToken`,
+`ListImages`, `DescribeImages` and push/pull — but **not** `BatchDeleteImage`,
+and not even `DescribeRepositories`. So a tag pushed with the wrong content can
+never be corrected or removed; it can only be abandoned and replaced by the next
+`-rN` revision. That is what the `-rN` suffix in the `MP_IMAGES` table is for.
+`build-addon.sh` checks each tag before writing: already-correct tags are
+skipped (re-running is a no-op) and a tag holding the wrong content fails with
+instructions to bump the revision.
+
+> `union-ai/flyte-eks-add-on:flyte-binary-v2.0.27` (no suffix) is **abandoned**.
+> An earlier build copied the full index and then tried to filter it in place,
+> which needs two writes to one tag; the first write landed, leaving the in-toto
+> attestation manifests attached, and the second was refused. It is unreferenced
+> by the chart — never list it in an Add Version request.
+
 Two things are **not** settled and need a human before submission:
 
 1. **Add-on category.** Marketplace restricts EKS add-ons to a fixed list

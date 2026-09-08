@@ -68,7 +68,7 @@ addon:
   # INVALID_HELM_UNDECLARED_IMAGES. Generated from MP_IMAGES in versions.env and
   # cross-checked by scripts/validate.sh.
   images:
-    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-binary-v2.0.27
-    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088
-    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-connectors-py3.12-v2.3.6
-    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:postgres-15-alpine
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-binary-v2.0.27-r1
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088-r1
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-connectors-py3.12-v2.3.6-r1
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:postgres-15-alpine-r1
