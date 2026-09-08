@@ -67,6 +67,29 @@ RENDERED="$(helm template flyte "${CHART_DIR}" \
   -f "${CONFIG}")"
 echo "${RENDERED}" | head -1 >/dev/null
 
+# Marketplace validates a submitted chart by templating it with DEFAULT VALUES
+# ONLY. Any `required` guard left unsatisfied by values.yaml fails ingestion with
+# INVALID_HELM_TEMPLATE, no matter how complete the example config is. This is
+# the exact command AWS documents, including the --set it passes.
+echo "== 4b. helm template with DEFAULTS ONLY (what Marketplace runs) =="
+helm template flyte-eks-add-on "${CHART_DIR}" \
+  --set k8version="${EKS_K8S_VERSION}" \
+  --kube-version "${EKS_K8S_VERSION}" \
+  --namespace "${ADDON_NAMESPACE}" \
+  --include-crds --no-hooks >/dev/null \
+  || fail "chart does not render with default values — INVALID_HELM_TEMPLATE at ingestion"
+echo "ok"
+
+# Only .Release.Name and .Release.Namespace survive the add-on framework's
+# conversion to plain manifests; anything else is INCOMPATIBLE_HELM_OBJECTS.
+# vendor-chart.sh patches .Release.Service out of the upstream tree.
+echo "== 4c. supported Helm release objects only =="
+UNSUPPORTED="$(grep -rho '\.Release\.[A-Za-z]*' "${CHART_DIR}" 2>/dev/null \
+  | sort -u | grep -vE '^\.Release\.(Name|Namespace)$' || true)"
+[[ -z "${UNSUPPORTED}" ]] \
+  || fail "unsupported Helm release objects in chart: $(echo "${UNSUPPORTED}" | tr '\n' ' ')"
+echo "ok"
+
 echo "== 5. rendered manifests reflect external config =="
 # The generated Flyte backend config (003-storage.yaml / 002-database.yaml) must
 # carry the S3 region + bucket and the Aurora host from the example config. If
@@ -156,7 +179,24 @@ def walk2(node, path=""):
 walk2(s)
 if leaks:
     sys.exit("schema declares secret-collecting fields: " + ", ".join(leaks))
-print("   schema ok (draft, camelCase, descriptions, no secret fields)")
+# values.yaml ships deliberate placeholders for fields the upstream chart wraps
+# in `required` (so it templates with defaults). The schema is what stops those
+# placeholders reaching a cluster, so the required chain must stay intact.
+need = {"": "flyteBinary", "flyteBinary": "configuration",
+        "flyteBinary.configuration": "database",
+        "flyteBinary.configuration.database": "postgres",
+        "flyteBinary.configuration.database.postgres": "host",
+        "flyteBinary.configuration.storage": "metadataContainer"}
+def node_at(path):
+    n = s
+    for part in filter(None, path.split(".")):
+        n = n["properties"][part]
+    return n
+for path, field in need.items():
+    if field not in (node_at(path).get("required") or []):
+        sys.exit(f"schema must mark {path + '.' if path else ''}{field} as required "
+                 "(values.yaml ships a placeholder default for it)")
+print("   schema ok (draft, camelCase, descriptions, no secret fields, required chain)")
 PY
 
 # 6c. Pod Identity declaration must name the same SA the chart creates and the

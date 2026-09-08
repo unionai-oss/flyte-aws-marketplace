@@ -3,31 +3,47 @@
   "title": "flyte-eks add-on configuration",
   "description": "Per-deployment configuration merged into the flyte-eks wrapper chart. CloudFormation (Artifact B) supplies these values via AWS::EKS::Addon ConfigurationValues; the helm-fallback path receives the identical document from scripts/render-config.sh. All keys are namespaced under `flyteBinary`, the Chart.yaml alias for the flyte-binary subchart that receives them. The data-offload prefix (`flyte-core-components.runs.storagePrefix`) and the ingress annotation blocks are always supplied by CloudFormation rather than by hand, and pass through additionalProperties rather than being declared here.",
   "type": "object",
+  "required": [
+    "flyteBinary"
+  ],
   "additionalProperties": true,
   "properties": {
     "flyteBinary": {
       "type": "object",
+      "required": [
+        "configuration"
+      ],
       "additionalProperties": true,
       "description": "Configuration for the Flyte 2 backend.",
       "properties": {
         "configuration": {
           "type": "object",
+          "required": [
+            "database",
+            "storage"
+          ],
           "additionalProperties": true,
           "description": "Backend configuration: external database and object store.",
           "properties": {
             "database": {
               "type": "object",
+              "required": [
+                "postgres"
+              ],
               "additionalProperties": true,
-              "description": "External PostgreSQL connection. flyte-binary v2 reads the connection from database.postgres.* (the flat database.* keys are v1 and ignored). The password is never passed here — it is mounted into the pod from the flyte-db-credentials Kubernetes Secret, which must exist in the add-on namespace before install.",
+              "description": "External PostgreSQL connection. flyte-binary v2 reads the connection from database.postgres.* (the flat database.* keys are v1 and ignored). The password is never passed here \u2014 it is mounted into the pod from the flyte-db-credentials Kubernetes Secret, which must exist in the add-on namespace before install.",
               "properties": {
                 "postgres": {
                   "type": "object",
+                  "required": [
+                    "host"
+                  ],
                   "additionalProperties": true,
                   "description": "PostgreSQL connection parameters.",
                   "properties": {
                     "host": {
                       "type": "string",
-                      "description": "Aurora Serverless v2 (PostgreSQL) writer endpoint."
+                      "description": "Aurora Serverless v2 (PostgreSQL) writer endpoint. Required: the chart ships a placeholder default that will not connect."
                     },
                     "port": {
                       "type": "integer",
@@ -55,32 +71,44 @@
             },
             "storage": {
               "type": "object",
+              "required": [
+                "metadataContainer",
+                "providerConfig"
+              ],
               "additionalProperties": true,
               "description": "Object store for Flyte metadata.",
               "properties": {
                 "metadataContainer": {
                   "type": "string",
-                  "description": "S3 bucket for Flyte metadata (the provisioned bucket). v2 has no separate userDataContainer."
+                  "description": "S3 bucket for Flyte metadata (the provisioned bucket). v2 has no separate userDataContainer. Required: the chart ships a placeholder default that is not a real bucket."
                 },
                 "providerConfig": {
                   "type": "object",
+                  "required": [
+                    "s3"
+                  ],
                   "additionalProperties": true,
                   "description": "Provider-specific object store settings.",
                   "properties": {
                     "s3": {
                       "type": "object",
+                      "required": [
+                        "region"
+                      ],
                       "additionalProperties": true,
                       "description": "Amazon S3 settings.",
                       "properties": {
                         "region": {
                           "type": "string",
-                          "description": "AWS region of the S3 bucket, e.g. us-east-1."
+                          "description": "AWS region of the S3 bucket, e.g. us-east-1. Required: the chart's default is us-east-1 regardless of where the cluster runs."
                         },
                         "authType": {
                           "type": "string",
-                          "enum": ["iam"],
+                          "enum": [
+                            "iam"
+                          ],
                           "default": "iam",
-                          "description": "Fixed to iam — credentials come from the EKS Pod Identity role. Static keys are rejected."
+                          "description": "Fixed to iam \u2014 credentials come from the EKS Pod Identity role. Static keys are rejected."
                         }
                       }
                     }
@@ -118,7 +146,9 @@
         },
         "tolerations": {
           "type": "array",
-          "items": { "type": "object" },
+          "items": {
+            "type": "object"
+          },
           "description": "Tolerations applied to the Flyte backend pods."
         },
         "affinity": {

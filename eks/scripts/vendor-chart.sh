@@ -34,6 +34,29 @@ helm pull "${FLYTE_CHART_NAME}" \
 [[ -f "${CHARTS_DIR}/${FLYTE_CHART_NAME}/Chart.yaml" ]] \
   || { echo "vendored chart missing Chart.yaml at ${CHARTS_DIR}/${FLYTE_CHART_NAME}" >&2; exit 1; }
 
+# --- Patch: remove .Release.Service -----------------------------------------
+# The EKS add-on framework supports only .Release.Name and .Release.Namespace.
+# Anything else fails ingestion with INCOMPATIBLE_HELM_OBJECTS, and upstream
+# flyte-binary uses .Release.Service in the `app.kubernetes.io/managed-by` label
+# of both its own helpers and the nested flyteconnector subchart.
+#
+# .Release.Service is always the literal "Helm" under `helm install`/`template`,
+# so substituting it changes nothing about the rendered output. Re-applied on
+# every vendor because this rewrites the freshly downloaded upstream tree.
+echo ">> Patching out .Release.Service (unsupported by the EKS add-on framework)"
+while IFS= read -r f; do
+  [[ -n "${f}" ]] || continue
+  sed -i.bak -E 's/\{\{-? *\.Release\.Service *-?\}\}/Helm/g' "${f}"
+  rm -f "${f}.bak"
+  echo "   patched ${f#"${CHARTS_DIR}/"}"
+done < <(grep -rl 'Release\.Service' "${CHARTS_DIR}" 2>/dev/null || true)
+
+if grep -rq 'Release\.Service' "${CHARTS_DIR}" 2>/dev/null; then
+  echo "FAIL: .Release.Service still present after patching:" >&2
+  grep -rn 'Release\.Service' "${CHARTS_DIR}" >&2
+  exit 1
+fi
+
 echo ">> Vendored:"
 ls -la "${CHARTS_DIR}/${FLYTE_CHART_NAME}"
 

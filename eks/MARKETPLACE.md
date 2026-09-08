@@ -61,6 +61,8 @@ in a review cycle. The non-obvious ones:
 | Config schema must not collect secrets | `passwordPath` and the Cognito/ACM ARNs are deliberately **not** declared in the schema. The DB password is mounted from the `flyte-db-credentials` Secret that Artifact B creates. `INVALID_HELM_SENSITIVE_CONFIG` otherwise. |
 | Dependencies must live inside the chart | `Chart.yaml` uses `repository: "file://charts/flyte-binary"` and `vendor-chart.sh` unpacks the dependency there. An `https://` repository is `INVALID_DEPENDENT_HELM_CHARTS` even when the tarball is vendored. |
 | Chart must contain a Deployment or DaemonSet | It does; the framework tracks add-on rollout through it. |
+| Only `.Release.Name` and `.Release.Namespace` are supported | Upstream flyte-binary uses `.Release.Service` in its `managed-by` label, in its own helpers and the nested flyteconnector's. `vendor-chart.sh` rewrites it to the literal `Helm` on every vendor — which is exactly what it renders to, so output is unchanged. `INCOMPATIBLE_HELM_OBJECTS` otherwise. |
+| The chart must template with **default values only** | Marketplace validates by running `helm template` with no config file. The upstream chart wraps `storage.metadataContainer` and `s3.region` in `required`, so empty defaults are `INVALID_HELM_TEMPLATE`. `values.yaml` ships placeholders and `aws_mp_configuration_schema.json` marks those fields `required`, so EKS rejects an install that leaves them — the placeholders can never reach a cluster. |
 | `helm lint` / `helm template` must pass at **helm 3.19** | `HELM_MIN_VERSION` in `versions.env`; `build-addon.sh` refuses to publish below it and `validate.sh` warns. |
 
 ### Marketplace ECR tags are immutable
@@ -74,6 +76,12 @@ never be corrected or removed; it can only be abandoned and replaced by the next
 skipped (re-running is a no-op) and a tag holding the wrong content fails with
 instructions to bump the revision.
 
+> Chart tag `0.1.0` is likewise **abandoned** — it was the first submission, which
+> failed ingestion on `.Release.Service` and on templating with default values.
+> Both are fixed in `0.1.1`. This is why the chart version and `ADDON_VERSION`
+> jumped without any change to the Flyte release: a rejected chart still burns
+> its tag.
+>
 > `union-ai/flyte-eks-add-on:flyte-binary-v2.0.27` (no suffix) is **abandoned**.
 > An earlier build copied the full index and then tried to filter it in place,
 > which needs two writes to one tag; the first write landed, leaving the in-toto
