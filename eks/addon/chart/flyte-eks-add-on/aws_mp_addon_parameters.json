@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "isPodIdentityCompatible": true,
+    "permissionsList": [
+      {
+        "serviceAccount": "flyte-backend",
+        "managedPolicies": []
+      }
+    ]
+  }
+}

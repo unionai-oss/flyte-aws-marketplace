@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Render the per-deployment add-on configuration document from simple inputs.
 #
-# This is the ONE place that maps friendly inputs -> the nested flyte-binary
+# This is the ONE place that maps friendly inputs -> the nested flyteBinary
 # configurationValues shape. Its output is consumed identically by BOTH install
 # paths (see resolve-install.sh):
 #   * add-on path : passed to `aws eks create-addon --configuration-values`
@@ -44,7 +44,7 @@ DB_USER="${DB_USER:-flyte}"
 DB_PASSWORD_PATH="${DB_PASSWORD_PATH:-/etc/db/secret/password}"
 
 cat <<YAML
-flyte-binary:
+flyteBinary:
   flyte-core-components:
     runs:
       storagePrefix: "s3://${S3_BUCKET}"

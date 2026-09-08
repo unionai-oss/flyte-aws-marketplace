@@ -5,42 +5,104 @@
 #
 # Steps (Marketplace container add-on flow):
 #   1. vendor the pinned chart
-#   2. relocate all chart images into the Marketplace ECR namespace
+#   2. relocate every image the chart renders into the Marketplace ECR
 #   3. package the wrapper chart as an OCI artifact + push to Marketplace ECR
-#   4. (in the Marketplace portal / API) attach configuration schema and submit
-#      the version for Conformitron validation
+#   4. (in the Marketplace portal) add the version, attaching the chart URI and
+#      the full image list, for the EKS console add-on delivery option
 #
-# Requires: helm, aws, and the Marketplace ECR registry from the listing.
+# Requires: helm >= 3.19, aws, and crane (github.com/google/go-containerregistry)
+#   brew install crane   |   go install github.com/google/go-containerregistry/cmd/crane@latest
+#
+# Why crane and not `docker pull/tag/push`: the source images are multi-arch and
+# Marketplace requires the add-on to support both AMD64 and ARM64, which a
+# docker pull/push round-trip flattens to the local machine's architecture.
+# `docker buildx imagetools create` preserves the index but does not copy blobs
+# across registries. crane does both.
+#
 # Env:
-#   MARKETPLACE_ECR   e.g. 709825985650.dkr.ecr.us-east-1.amazonaws.com/<listing>
-#   AWS_REGION
+#   AWS_REGION        region of the Marketplace ECR (us-east-1)
+#   MARKETPLACE_ECR   override the registry/repo from versions.env (optional)
+#   SKIP_IMAGES=1     push only the chart (images already mirrored)
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/versions.env"
-: "${MARKETPLACE_ECR:?MARKETPLACE_ECR is required (from the Marketplace listing)}"
 : "${AWS_REGION:?AWS_REGION is required}"
-CHART_DIR="${REPO_ROOT}/addon/chart/flyte-eks"
+CHART_DIR="${REPO_ROOT}/addon/chart/flyte-eks-add-on"
+MARKETPLACE_ECR="${MARKETPLACE_ECR:?MARKETPLACE_ECR is required (set in versions.env)}"
+REGISTRY="${MARKETPLACE_ECR%%/*}"
+# helm push appends <chart name>:<version> to the OCI ref, and the chart is named
+# flyte-eks-add-on to match the Marketplace-provisioned repository. So the push
+# target is the repo's PARENT (the seller namespace), not the repo itself.
+CHART_PUSH_TARGET="oci://${MARKETPLACE_ECR%/*}"
+
+need() { command -v "$1" >/dev/null || { echo "$1 not found on PATH — see the header of this script" >&2; exit 1; }; }
+need helm; need aws; need crane
+
+# Marketplace validates submitted charts with helm 3.19; lint/template behaviour
+# differs enough between minors that building with an older helm can ship a
+# chart that fails ingestion.
+HELM_V="$(helm version --template '{{.Version}}' | tr -d 'v')"
+if [[ "$(printf '%s\n%s\n' "${HELM_MIN_VERSION}" "${HELM_V}" | sort -V | head -1)" != "${HELM_MIN_VERSION}" ]]; then
+  echo "helm ${HELM_V} is older than the Marketplace validation floor ${HELM_MIN_VERSION}" >&2
+  exit 1
+fi
 
 echo ">> [1/4] vendor chart"
 "${REPO_ROOT}/scripts/vendor-chart.sh"
 
-echo ">> [2/4] enumerate chart images (relocation targets)"
-# helm template + parse images. In CI these are mirrored into MARKETPLACE_ECR
-# with `docker pull/tag/push` (or crane/skopeo). Left as an explicit list so the
-# metadata.yaml images[] stays authoritative and reviewable.
-helm template flyte "${CHART_DIR}" -f "${REPO_ROOT}/addon/values/example-config.yaml" \
-  | grep -Eo 'image: "?[^"]+' | sed 's/image: //; s/"//g' | sort -u \
-  | tee "${REPO_ROOT}/build-images.txt"
-echo ">> TODO(pipeline): mirror the images above into ${MARKETPLACE_ECR}"
-
-echo ">> [3/4] package + push wrapper chart as OCI artifact"
-mkdir -p "${REPO_ROOT}/dist"
-helm package "${CHART_DIR}" --destination "${REPO_ROOT}/dist"
+echo ">> [2/4] authenticate to ${REGISTRY}"
 aws ecr get-login-password --region "${AWS_REGION}" \
-  | helm registry login --username AWS --password-stdin "${MARKETPLACE_ECR%%/*}"
-helm push "${REPO_ROOT}/dist/flyte-eks-${ADDON_VERSION#v}.tgz" "oci://${MARKETPLACE_ECR}"
+  | crane auth login --username AWS --password-stdin "${REGISTRY}"
+aws ecr get-login-password --region "${AWS_REGION}" \
+  | helm registry login --username AWS --password-stdin "${REGISTRY}"
 
-echo ">> [4/4] Submit version ${ADDON_VERSION} in the Marketplace portal:"
-echo "         - attach addon/addon-configuration-schema.json"
-echo "         - run Conformitron / Addons Transformer validation"
-echo "         See MARKETPLACE.md."
+echo ">> [3/4] relocate images into ${MARKETPLACE_ECR}"
+if [[ "${SKIP_IMAGES:-0}" == "1" ]]; then
+  echo "   SKIP_IMAGES=1 — skipping"
+else
+  for row in "${MP_IMAGES[@]}"; do
+    src="${row%%|*}"
+    dst="${MARKETPLACE_ECR}:${row##*|}"
+    echo "   ${src}"
+    echo "     -> ${dst}"
+    # Copy the whole index (all platforms, all referrers), then rewrite the
+    # index in place keeping only the two required platforms. That second pass
+    # drops the in-toto attestation manifests that every buildx-built image
+    # carries as `unknown/unknown` children — Marketplace's security scan
+    # rejects them as "layers with unsupported architectures".
+    crane copy "${src}" "${dst}"
+    crane index filter "${dst}" \
+      --platform linux/amd64 --platform linux/arm64 \
+      -t "${dst}"
+
+    # Fail loudly rather than discovering this during Marketplace ingestion.
+    platforms="$(crane manifest "${dst}" \
+      | jq -r '[.manifests[]?.platform | "\(.os)/\(.architecture)"] | sort | join(",")')"
+    [[ "${platforms}" == "linux/amd64,linux/arm64" ]] \
+      || { echo "     FAIL: ${dst} has platforms [${platforms}], expected [${MP_PLATFORMS}]" >&2; exit 1; }
+    echo "     ok: ${platforms}"
+  done
+fi
+
+echo ">> [4/4] package + push wrapper chart as OCI artifact"
+mkdir -p "${REPO_ROOT}/dist"
+rm -f "${REPO_ROOT}/dist/flyte-eks-add-on-"*.tgz
+helm package "${CHART_DIR}" --destination "${REPO_ROOT}/dist"
+helm push "${REPO_ROOT}/dist/flyte-eks-add-on-${ADDON_VERSION#v}.tgz" "${CHART_PUSH_TARGET}"
+
+cat <<EOF
+
+>> Pushed. Now add the version in the Marketplace portal
+   (Server products -> this product -> Request changes -> Add new version),
+   choosing the "Amazon EKS console add-on" delivery option:
+
+     Helm chart URI  : ${MARKETPLACE_ECR}:${ADDON_VERSION#v}
+     Container images: $(for row in "${MP_IMAGES[@]}"; do printf '\n                       %s:%s' "${MARKETPLACE_ECR}" "${row##*|}"; done)
+     Add-on version  : ${ADDON_VERSION#v}      (major.minor.patch — no leading v)
+     Namespace       : ${ADDON_NAMESPACE}
+     Architectures   : ${MP_PLATFORMS}
+     Visibility      : Limited
+
+   Every image above must be listed, or ingestion fails with
+   INVALID_HELM_UNDECLARED_IMAGES. See MARKETPLACE.md.
+EOF

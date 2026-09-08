@@ -6,7 +6,7 @@
 #   S3_BUCKET=flyte-abc123 AWS_REGION=us-east-1 \
 #   INGRESS_HOST=flyte.example.com \
 #     scripts/render-config.sh > my-config.yaml
-flyte-binary:
+flyteBinary:
   flyte-core-components:
     runs:
       storagePrefix: "s3://flyte-example-bucket"

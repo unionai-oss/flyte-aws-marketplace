@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "flyte-eks add-on configuration",
+  "description": "Per-deployment configuration merged into the flyte-eks wrapper chart. CloudFormation (Artifact B) supplies these values via AWS::EKS::Addon ConfigurationValues; the helm-fallback path receives the identical document from scripts/render-config.sh. All keys are namespaced under `flyteBinary`, the Chart.yaml alias for the flyte-binary subchart that receives them. The data-offload prefix (`flyte-core-components.runs.storagePrefix`) and the ingress annotation blocks are always supplied by CloudFormation rather than by hand, and pass through additionalProperties rather than being declared here.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "flyteBinary": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Configuration for the Flyte 2 backend.",
+      "properties": {
+        "configuration": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Backend configuration: external database and object store.",
+          "properties": {
+            "database": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "External PostgreSQL connection. flyte-binary v2 reads the connection from database.postgres.* (the flat database.* keys are v1 and ignored). The password is never passed here — it is mounted into the pod from the flyte-db-credentials Kubernetes Secret, which must exist in the add-on namespace before install.",
+              "properties": {
+                "postgres": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "PostgreSQL connection parameters.",
+                  "properties": {
+                    "host": {
+                      "type": "string",
+                      "description": "Aurora Serverless v2 (PostgreSQL) writer endpoint."
+                    },
+                    "port": {
+                      "type": "integer",
+                      "default": 5432,
+                      "description": "PostgreSQL port."
+                    },
+                    "dbname": {
+                      "type": "string",
+                      "default": "flyte",
+                      "description": "Database name."
+                    },
+                    "username": {
+                      "type": "string",
+                      "default": "flyte",
+                      "description": "Database user."
+                    },
+                    "options": {
+                      "type": "string",
+                      "default": "sslmode=require",
+                      "description": "Connection options appended to the DSN."
+                    }
+                  }
+                }
+              }
+            },
+            "storage": {
+              "type": "object",
+              "additionalProperties": true,
+              "description": "Object store for Flyte metadata.",
+              "properties": {
+                "metadataContainer": {
+                  "type": "string",
+                  "description": "S3 bucket for Flyte metadata (the provisioned bucket). v2 has no separate userDataContainer."
+                },
+                "providerConfig": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "description": "Provider-specific object store settings.",
+                  "properties": {
+                    "s3": {
+                      "type": "object",
+                      "additionalProperties": true,
+                      "description": "Amazon S3 settings.",
+                      "properties": {
+                        "region": {
+                          "type": "string",
+                          "description": "AWS region of the S3 bucket, e.g. us-east-1."
+                        },
+                        "authType": {
+                          "type": "string",
+                          "enum": ["iam"],
+                          "default": "iam",
+                          "description": "Fixed to iam — credentials come from the EKS Pod Identity role. Static keys are rejected."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "ingress": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "ALB ingress for the Flyte API and web console.",
+          "properties": {
+            "create": {
+              "type": "boolean",
+              "default": false,
+              "description": "Create Ingress resources. Requires the AWS Load Balancer Controller."
+            },
+            "host": {
+              "type": "string",
+              "description": "Public hostname, e.g. flyte.example.com (prod mode only)."
+            }
+          }
+        },
+        "replicaCount": {
+          "type": "integer",
+          "default": 2,
+          "description": "Number of Flyte backend replicas."
+        },
+        "nodeSelector": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Node labels the Flyte backend pods must match."
+        },
+        "tolerations": {
+          "type": "array",
+          "items": { "type": "object" },
+          "description": "Tolerations applied to the Flyte backend pods."
+        },
+        "affinity": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Affinity rules for the Flyte backend pods."
+        },
+        "podLabels": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Additional Kubernetes labels applied to the Flyte backend pods."
+        },
+        "podAnnotations": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Additional Kubernetes annotations applied to the Flyte backend pods."
+        },
+        "resources": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "CPU and memory requests and limits for the Flyte backend container."
+        }
+      }
+    }
+  }
+}

@@ -6,11 +6,22 @@
 addon:
   # Marketplace add-on name. Public add-ons are referenced by AWS::EKS::Addon as
   # "<publisher>_<name>" once published; kept in versions.env as ADDON_PRODUCT_NAME.
-  name: flyte-eks
+  # This is also the wrapper chart's name, because `helm push` derives the ECR
+  # repository from it and the repository provisioned by the listing is
+  # union-ai/flyte-eks-add-on.
+  name: flyte-eks-add-on
   displayName: "Flyte 2 for Amazon EKS"
   publisher: "Union.ai"
   # Semantic version of the add-on (== wrapper Chart.yaml version == ADDON_VERSION).
+  # The portal wants major.minor.patch with no leading "v".
   version: "0.1.0"
+
+  # Add-on category, chosen from the fixed list Marketplace allows for EKS
+  # add-on products. Flyte is a workflow orchestrator rather than a cluster
+  # operational component, so it fits under the "operational software that
+  # enhances Kubernetes" allowance — confirm with Marketplace ops before
+  # submitting (see MARKETPLACE.md).
+  type: kubernetes-management
 
   # The Flyte backend delivered by this version.
   flyteVersion: "2.0.27"
@@ -22,7 +33,13 @@ addon:
     full-stack product, which provisions the database, bucket, IAM, and ingress.
 
   # Namespace the add-on installs into (must match PodIdentityAssociation).
+  # default/kube-system/kube-public are rejected for third-party add-ons.
   namespace: flyte
+
+  # Both are required for an EKS add-on product.
+  supportedArchitectures:
+    - AMD64
+    - ARM64
 
   # Pod Identity: the CloudFormation stack creates the role + association for
   # this (namespace, serviceAccount) pair. Declared here for documentation and
@@ -37,8 +54,21 @@ addon:
       - s3:DeleteObject
       - s3:ListBucket
 
-  configurationSchema: addon-configuration-schema.json
+  # Both files live at the top level of the chart, where the add-on framework
+  # reads them by these exact names. See addon/chart/flyte-eks-add-on/README.md.
+  configurationSchema: chart/flyte-eks-add-on/aws_mp_configuration_schema.json
+  addonParameters: chart/flyte-eks-add-on/aws_mp_addon_parameters.json
 
-  # Container images that must be relocated into the Marketplace-provisioned ECR
-  # at publish time (populated from the vendored chart by scripts/build-addon.sh).
-  images: []
+  # The chart itself, pushed as an OCI artifact by scripts/build-addon.sh.
+  helmChartUri: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:0.1.0
+
+  # Every container image the chart renders, after relocation into the
+  # Marketplace ECR. This list is entered verbatim in the Add Version request —
+  # an image the chart pulls but the request omits fails ingestion with
+  # INVALID_HELM_UNDECLARED_IMAGES. Generated from MP_IMAGES in versions.env and
+  # cross-checked by scripts/validate.sh.
+  images:
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-binary-v2.0.27
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-connectors-py3.12-v2.3.6
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:postgres-15-alpine

@@ -69,8 +69,10 @@ install_via_addon() {
 
 install_via_helm() {
   echo ">> Installing Flyte via helm fallback (add-on ${ADDON_VERSION} not published)"
-  local chart_dir="${REPO_ROOT}/addon/chart/flyte-eks"
-  if [[ ! -d "${chart_dir}/charts" ]] || ! ls "${chart_dir}/charts/${FLYTE_CHART_NAME}"-*.tgz >/dev/null 2>&1; then
+  local chart_dir="${REPO_ROOT}/addon/chart/flyte-eks-add-on"
+  # vendor-chart.sh unpacks the dependency into charts/<name>/ so Chart.yaml can
+  # reference it with file:// (Marketplace forbids external dependencies).
+  if [[ ! -f "${chart_dir}/charts/${FLYTE_CHART_NAME}/Chart.yaml" ]]; then
     echo ">> Chart not vendored yet; running vendor-chart.sh"
     "${REPO_ROOT}/scripts/vendor-chart.sh"
   fi
@@ -91,9 +93,10 @@ install_via_helm() {
     fi
   fi
 
+  # No --dependency-update: the file:// dependency source lives inside charts/
+  # itself, so re-resolving it would delete the tree it is copying from.
   helm upgrade --install flyte "${chart_dir}" \
     --namespace "${ADDON_NAMESPACE}" --create-namespace \
-    --dependency-update \
     -f "${CONFIG_FILE}" \
     --wait --timeout 15m
 }

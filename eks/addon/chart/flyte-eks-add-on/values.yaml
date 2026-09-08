@@ -7,12 +7,67 @@
 # scripts/render-config.sh for the helm-fallback path. Both merge ON TOP of the
 # keys below, so the two install paths are byte-equivalent.
 #
-# All keys are namespaced under `flyte-binary:` because it is a subchart — that
-# is exactly the shape the add-on configurationValues must take, since EKS
+# All keys are namespaced under `flyteBinary:` — the Chart.yaml `alias` for the
+# flyte-binary subchart. EKS add-on configuration parameters must be camelCase,
+# so the subchart is aliased rather than addressed by its kebab-case real name.
+# That is exactly the shape the add-on configurationValues must take, since EKS
 # merges the blob straight into the packaged chart's values.
 # ============================================================================
 
-flyte-binary:
+flyteBinary:
+  # The alias above also renames .Chart.Name inside the subchart, and its
+  # fullname helper is `<release>-<chart name>`. Without this override every
+  # rendered resource would be `flyte-flyteBinary-*` — not a valid DNS-1123
+  # name, and a break for everything that addresses flyte-flyte-binary-http
+  # (smoke-test.sh, cloudformation/root.yaml, render-config.sh HTTP_SERVICE_NAME).
+  nameOverride: flyte-binary
+
+  # ---- Images: all relocated into the Marketplace ECR ----------------------
+  # Marketplace requires every image — including open-source dependencies like
+  # postgres — to be served from the listing's own ECR repository, with an
+  # explicit tag. References must be defined here in values.yaml and nowhere
+  # else, so AWS can rewrite the registry when replicating across regions.
+  # Source images and tags are the MP_IMAGES table in versions.env, which
+  # scripts/validate.sh cross-checks against this file.
+
+  # Flyte 2 backend (flyte-binary-v2).
+  deployment:
+    image:
+      repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
+      tag: flyte-binary-v2.0.27
+    # initContainer that waits for Aurora to accept connections.
+    waitForDB:
+      image:
+        repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
+        tag: postgres-15-alpine
+
+    # ---- Mount the DB password secret into the backend pod ----------------
+    # NOTE: exact key names for extra volumes are verified in scripts/validate.sh
+    # against the vendored chart. The secret `flyte-db-credentials` is created by
+    # the CloudFormation bootstrap custom resource before the add-on installs.
+    extraVolumes:
+      - name: db-secret
+        secret:
+          secretName: flyte-db-credentials
+    extraVolumeMounts:
+      - name: db-secret
+        mountPath: /etc/db/secret
+        readOnly: true
+
+  # Flyte web console (flyteconsole-v2). Upstream publishes only commit-SHA
+  # tags and floats `latest`; a floating tag fails Marketplace ingestion with
+  # MISSING_IMAGE_TAG, so this is pinned to the commit latest resolved to.
+  console:
+    image:
+      repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
+      tag: flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088
+
+  # Connector service (nested subchart of flyte-binary).
+  flyteconnector:
+    image:
+      repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
+      tag: flyte-connectors-py3.12-v2.3.6
+
   # Data offload prefix for the unified Flyte manager. Set per-deploy to
   # s3://<provisioned-bucket> (see render-config.sh / configurationValues).
   flyte-core-components:
@@ -21,6 +76,12 @@ flyte-binary:
 
   # ---- Object store: S3 via EKS Pod Identity (no static keys) --------------
   configuration:
+    # FlyteCopilot sidecar injected into task pods — same backend image.
+    co-pilot:
+      image:
+        repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
+        tag: flyte-binary-v2.0.27
+
     storage:
       provider: s3
       # metadataContainer is the only container key in flyte-binary v2 (there is
@@ -45,6 +106,8 @@ flyte-binary:
         # Password is NOT inlined. It is mounted from a Kubernetes Secret the
         # CloudFormation bootstrap creates (synced from Secrets Manager) and read
         # via passwordPath. Leave `password` unset so the chart creates no Secret.
+        # Deliberately absent from aws_mp_configuration_schema.json: the add-on
+        # config surface must not appear to collect secret material.
         passwordPath: /etc/db/secret/password
         options: "sslmode=require"
 
@@ -61,6 +124,9 @@ flyte-binary:
   # ---- Service account bound to the S3 IAM role via PodIdentityAssociation --
   # The name is FIXED so the CloudFormation AWS::EKS::PodIdentityAssociation can
   # reference (namespace=flyte, serviceAccount=flyte-backend) deterministically.
+  # `create: true` is required by Marketplace: a buyer installing from the EKS
+  # console may attach permissions to this SA, which only works if the chart
+  # creates it.
   serviceAccount:
     create: true
     name: flyte-backend
@@ -75,20 +141,6 @@ flyte-binary:
     ingressClassName: alb
     separateGrpcIngress: true
     host: ""                  # per-deploy: flyte.<domain>
-
-  # ---- Mount the DB password secret into the backend pod -------------------
-  # NOTE: exact key names for extra volumes are verified in scripts/validate.sh
-  # against the vendored chart. The secret `flyte-db-credentials` is created by
-  # the CloudFormation bootstrap custom resource before the add-on installs.
-  deployment:
-    extraVolumes:
-      - name: db-secret
-        secret:
-          secretName: flyte-db-credentials
-    extraVolumeMounts:
-      - name: db-secret
-        mountPath: /etc/db/secret
-        readOnly: true
 
   # Reasonable production-lean defaults; overridable per-deploy.
   replicaCount: 2
