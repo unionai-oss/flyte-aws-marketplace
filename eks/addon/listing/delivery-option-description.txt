@@ -1,0 +1,5 @@
+Installs the Flyte 2 control plane into an Amazon EKS cluster as a managed
+add-on. Runs the flyte-binary backend, the Flyte web console, and the connector
+service, wired to an external PostgreSQL database and an Amazon S3 bucket
+through EKS Pod Identity. Designed to be installed by the companion
+CloudFormation product, which provisions those resources.

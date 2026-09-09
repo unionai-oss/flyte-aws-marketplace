@@ -1,0 +1,31 @@
+Delivers the Flyte 2 control plane (flyte-binary), including the Flyte web
+console and the connector service, installed into the "flyte" namespace.
+
+This add-on installs in-cluster resources only. It does not provision the
+database, object store, or IAM role it depends on. Install the companion
+"Flyte 2 on AWS" CloudFormation product first, which creates all of them and
+installs this add-on for you. Without those resources this add-on has very
+limited utility.
+
+Prerequisites, if installing this add-on directly rather than through the
+CloudFormation product:
+
+  - An Amazon EKS cluster running a supported Kubernetes version.
+  - A PostgreSQL database (Amazon Aurora Serverless v2 recommended) reachable
+    from the cluster, plus a Kubernetes Secret named "flyte-db-credentials" in
+    the flyte namespace with the password under the key "password".
+  - An Amazon S3 bucket for Flyte metadata and task data.
+  - An IAM role granting s3:GetObject, s3:PutObject, s3:DeleteObject,
+    s3:ListBucket and s3:GetBucketLocation on that bucket, attached through an
+    EKS Pod Identity association to the "flyte-backend" service account in the
+    flyte namespace.
+  - A "flyte-task" service account in the flyte namespace, bound to the same
+    role, for task pods.
+  - The AWS Load Balancer Controller, if you enable the ALB ingress.
+
+Configure the database endpoint, bucket, and region through the add-on
+configuration schema. The database password is never passed as configuration;
+it is read from the flyte-db-credentials Secret at runtime.
+
+Supports AMD64 and ARM64. The web console is served at /v2 behind the ingress
+host.

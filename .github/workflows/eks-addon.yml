@@ -1,0 +1,128 @@
+# Publishes a new EKS add-on version when upstream ships a new flyte-binary
+# chart. Splits into two halves on purpose:
+#
+#   release  — detect, bump, validate, push chart + images to the Marketplace
+#              ECR, open a PR. Safe and idempotent; nothing here is irreversible.
+#   submit   — the Catalog API change request. Manual, because a rejected
+#              submission permanently burns the chart tag (Marketplace ECR tags
+#              are immutable and sellers cannot delete them), and because
+#              Marketplace refuses a new version while the previous one is still
+#              working its way into the EKS console.
+name: EKS add-on
+
+on:
+  schedule:
+    - cron: "0 8 * * *"        # daily upstream check
+  workflow_dispatch:
+    inputs:
+      flyte_version:
+        description: "flyte-binary chart version to move to (blank = latest upstream)"
+        type: string
+      submit:
+        description: "Also submit the version to AWS Marketplace (irreversible; burns the chart tag on rejection)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write             # push the bump branch
+  pull-requests: write
+  id-token: write
+
+env:
+  AWS_REGION: us-east-1
+
+concurrency:
+  group: eks-addon
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      bumped: ${{ steps.check.outputs.bumped }}
+      addon: ${{ steps.check.outputs.addon }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.19.0     # the version Marketplace validates with
+      - uses: imjasonh/setup-crane@v0.4
+
+      - id: check
+        name: compare upstream chart against the pin
+        run: |
+          source eks/versions.env
+          if [ -n "${{ inputs.flyte_version }}" ]; then
+            LATEST="${{ inputs.flyte_version }}"
+          else
+            helm repo add flyte "$FLYTE_CHART_REPO" >/dev/null
+            helm repo update >/dev/null
+            LATEST=$(helm search repo flyte/$FLYTE_CHART_NAME --versions -o json \
+                       | python3 -c 'import json,sys;print(json.load(sys.stdin)[0]["version"])')
+          fi
+          echo "pinned: $FLYTE_CHART_VERSION   upstream: $LATEST"
+          if [ "$LATEST" = "$FLYTE_CHART_VERSION" ]; then
+            echo "bumped=false" >> "$GITHUB_OUTPUT"
+            echo "Already on the newest chart — nothing to do."
+            exit 0
+          fi
+          # A new upstream chart always needs a new add-on version; bump the patch.
+          NEXT=$(python3 -c "
+          major, minor, patch = '${ADDON_VERSION#v}'.split('.')
+          print(f'{major}.{minor}.{int(patch)+1}')")
+          eks/scripts/bump-version.sh --flyte "$LATEST" --addon "$NEXT"
+          echo "bumped=true" >> "$GITHUB_OUTPUT"
+          echo "addon=$NEXT" >> "$GITHUB_OUTPUT"
+          echo "flyte=$LATEST" >> "$GITHUB_OUTPUT"
+
+      - name: validate
+        if: steps.check.outputs.bumped == 'true'
+        run: |
+          python3 -m pip install --quiet --upgrade cfn-lint
+          eks/scripts/validate.sh
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.check.outputs.bumped == 'true'
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: relocate images + push chart to the Marketplace ECR
+        if: steps.check.outputs.bumped == 'true'
+        # Idempotent: build-addon.sh skips image tags already present and
+        # correct, and refuses to overwrite one holding the wrong content.
+        run: eks/scripts/build-addon.sh
+
+      - name: open the bump PR
+        if: steps.check.outputs.bumped == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="bump/flyte-${{ steps.check.outputs.flyte }}-addon-${{ steps.check.outputs.addon }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -qam "eks: flyte-binary ${{ steps.check.outputs.flyte }}, add-on ${{ steps.check.outputs.addon }}
+
+          Artifacts are already pushed to the Marketplace ECR. Submit the version
+          with the EKS add-on workflow (submit: true) once this merges and the
+          previous version is live in the EKS console."
+          git push -u origin "$BRANCH"
+          gh pr create --fill --base main \
+            --title "eks: flyte-binary ${{ steps.check.outputs.flyte }}, add-on ${{ steps.check.outputs.addon }}"
+
+  submit:
+    name: submit version to AWS Marketplace
+    needs: release
+    if: inputs.submit && needs.release.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    # Gate this behind a GitHub Environment with required reviewers: the change
+    # request cannot be withdrawn, and a rejection costs a chart version.
+    environment: marketplace-publish
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: eks/scripts/submit-version.sh

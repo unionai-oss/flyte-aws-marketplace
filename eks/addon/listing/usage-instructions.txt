@@ -1,0 +1,111 @@
+Flyte 2 for Amazon EKS installs the Flyte control plane into your cluster. It
+creates in-cluster resources only; you must provide the database, S3 bucket,
+and IAM role it depends on.
+
+The supported path is the companion "Flyte 2 on AWS" CloudFormation product,
+which provisions all prerequisites and installs this add-on for you. The steps
+below are for installing into an existing cluster.
+
+PREREQUISITES
+
+1. An Amazon EKS cluster with the EKS Pod Identity Agent add-on installed.
+
+2. A PostgreSQL database (Amazon Aurora Serverless v2 recommended) reachable
+   from the cluster, with a database and user named "flyte".
+
+3. An Amazon S3 bucket in the same region as the cluster.
+
+4. An IAM role with this policy, scoped to that bucket:
+     s3:GetObject, s3:PutObject, s3:DeleteObject on arn:aws:s3:::BUCKET/*
+     s3:ListBucket, s3:GetBucketLocation on arn:aws:s3:::BUCKET
+
+5. The namespace, the database password Secret, and the task service account:
+
+     kubectl create namespace flyte
+
+     kubectl -n flyte create secret generic flyte-db-credentials \
+       --from-literal=password='YOUR_DB_PASSWORD'
+
+     kubectl -n flyte create serviceaccount flyte-task
+
+   The add-on reads the password from this Secret at runtime. It is never
+   passed as add-on configuration.
+
+6. Pod Identity associations binding the IAM role to both service accounts:
+
+     aws eks create-pod-identity-association --cluster-name CLUSTER \
+       --namespace flyte --service-account flyte-backend --role-arn ROLE_ARN
+
+     aws eks create-pod-identity-association --cluster-name CLUSTER \
+       --namespace flyte --service-account flyte-task --role-arn ROLE_ARN
+
+INSTALL
+
+Write the configuration, substituting your database endpoint, bucket, and
+region:
+
+  cat > flyte-config.json <<'JSON'
+  {
+    "flyteBinary": {
+      "flyte-core-components": {
+        "runs": { "storagePrefix": "s3://BUCKET" }
+      },
+      "configuration": {
+        "database": {
+          "postgres": {
+            "host": "DB_WRITER_ENDPOINT",
+            "port": 5432,
+            "dbname": "flyte",
+            "username": "flyte"
+          }
+        },
+        "storage": {
+          "metadataContainer": "BUCKET",
+          "providerConfig": {
+            "s3": { "region": "AWS_REGION", "authType": "iam" }
+          }
+        }
+      }
+    }
+  }
+  JSON
+
+Install the add-on. Omitting --addon-version installs the default version for
+your cluster's Kubernetes version:
+
+  aws eks create-addon \
+    --cluster-name CLUSTER \
+    --addon-name union-ai_flyte \
+    --configuration-values file://flyte-config.json \
+    --pod-identity-associations serviceAccount=flyte-backend,roleArn=ROLE_ARN
+
+  aws eks wait addon-active --cluster-name CLUSTER --addon-name union-ai_flyte
+
+VERIFY
+
+  kubectl -n flyte rollout status deploy -l app.kubernetes.io/name=flyte-binary
+  kubectl -n flyte port-forward svc/flyte-flyte-binary-http 8089:8090
+
+The Flyte API is then reachable at localhost:8089. Point the Flyte SDK at it
+with --endpoint dns:///localhost:8089 --insecure.
+
+EXPOSING FLYTE PUBLICLY
+
+To serve Flyte on a hostname through an Application Load Balancer, install the
+AWS Load Balancer Controller and add to the configuration:
+
+  "ingress": { "create": true, "host": "flyte.example.com" }
+
+The web console is served at /v2 on that host. The companion CloudFormation
+product additionally configures Amazon Cognito authentication on the load
+balancer; configuring that by hand is outside the scope of these instructions.
+
+UPGRADING
+
+List the versions available to your cluster, then update:
+
+  aws eks describe-addon-versions --addon-name union-ai_flyte \
+    --query 'addons[].addonVersions[].addonVersion'
+
+  aws eks update-addon --cluster-name CLUSTER --addon-name union-ai_flyte \
+    --addon-version VERSION --resolve-conflicts PRESERVE

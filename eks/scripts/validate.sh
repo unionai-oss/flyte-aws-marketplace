@@ -42,6 +42,12 @@ grep -q "version: ${FLYTE_CHART_VERSION}" "${CHART_DIR}/Chart.yaml" \
 # `helm push` derives the ECR repository from the chart name, so the chart must
 # be named for the Marketplace-provisioned repository or it lands in a repo that
 # does not exist and cannot be created.
+# The EKS catalog name must agree with what the resolver queries for, or every
+# deploy silently falls back to helm forever.
+ADDON_NAME_IN_META="$(awk '/^  addOnName:/{print $2; exit}' "${METADATA}")"
+[[ "${ADDON_PRODUCT_NAME}" == *"_${ADDON_NAME_IN_META}" ]] \
+  || fail "ADDON_PRODUCT_NAME (${ADDON_PRODUCT_NAME}) does not end in _${ADDON_NAME_IN_META} from metadata.yaml addOnName"
+
 MP_REPO_NAME="${MARKETPLACE_REPO##*/}"
 grep -q "^name: ${MP_REPO_NAME}$" "${CHART_DIR}/Chart.yaml" \
   || fail "Chart.yaml name != Marketplace repository basename (${MP_REPO_NAME})"

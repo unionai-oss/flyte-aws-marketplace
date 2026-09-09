@@ -1,0 +1,133 @@
+# Builds and publishes the devbox AMI in the SELLER account (747712783559),
+# which is where AWS Marketplace requires the AMI to live.
+#
+# Port of .buildkite/{check-and-build.sh,build-publish.yml}, with the same gate:
+# the AMI id is only written to SSM after the smoke test passes, so a deploy
+# never picks up an unvalidated image.
+name: devbox AMI
+
+on:
+  schedule:
+    - cron: "0 7 * * *"        # daily; a no-op unless the devbox image changed
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if the devbox image digest has not changed"
+        type: boolean
+        default: false
+      skip_smoke:
+        description: "Skip the smoke test. Publishes an UNVALIDATED AMI to SSM."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write             # OIDC assume-role; no long-lived AWS keys
+
+env:
+  AWS_REGION: us-east-1
+  DEVBOX_IMAGE: cr.flyte.org/flyteorg/flyte-devbox:latest
+  DIGEST_PARAM: /flyte-devbox/ami/source-digest
+  AMI_PARAM: /flyte-devbox/ami/latest
+
+concurrency:
+  group: devbox-ami           # never two packer builds racing for the same SSM pointer
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: check for a new devbox release
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.digest.outputs.build }}
+      digest: ${{ steps.digest.outputs.current }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - id: digest
+        run: |
+          CURRENT=$(docker buildx imagetools inspect "$DEVBOX_IMAGE" | awk '/^Digest:/{print $2; exit}')
+          [ -n "$CURRENT" ] || { echo "could not resolve digest for $DEVBOX_IMAGE" >&2; exit 1; }
+          PUBLISHED=$(aws ssm get-parameter --name "$DIGEST_PARAM" --query Parameter.Value --output text 2>/dev/null || echo none)
+          echo "current:   $CURRENT"
+          echo "published: $PUBLISHED"
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+          if [ "${{ inputs.force }}" = "true" ] || [ "$CURRENT" != "$PUBLISHED" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "No new devbox release — nothing to build."
+          fi
+
+  build:
+    name: packer build
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      ami: ${{ steps.packer.outputs.ami }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: hashicorp/setup-packer@v3
+      - id: packer
+        working-directory: devbox/packer
+        run: |
+          packer init .
+          # The build instance needs a public subnet; the seller account's
+          # default VPC provides one in every AZ.
+          SUBNET=$(aws ec2 describe-subnets --filters Name=map-public-ip-on-launch,Values=true \
+                     --query 'Subnets[0].SubnetId' --output text)
+          VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+          echo "building in $VPC / $SUBNET"
+          packer build -var subnet_id="$SUBNET" -var vpc_id="$VPC" \
+            -var devbox_image="$DEVBOX_IMAGE" -machine-readable . | tee /tmp/packer.log
+          AMI=$(grep 'artifact,0,id' /tmp/packer.log | cut -d, -f6 | cut -d: -f2)
+          [ -n "$AMI" ] || { echo "packer produced no AMI id" >&2; exit 1; }
+          echo "built $AMI"
+          echo "ami=$AMI" >> "$GITHUB_OUTPUT"
+
+  smoke:
+    name: smoke test (deploy -> flyte run -> teardown)
+    needs: [check, build]
+    if: needs.check.outputs.build == 'true' && !inputs.skip_smoke
+    runs-on: ubuntu-latest
+    # Real AWS spend: a full devbox stack (EC2 + Aurora + ALB + Cognito). The
+    # role needs CloudFormation/RDS/ELB/Cognito rights beyond what publishing
+    # uses — see .github/workflows/README.md.
+    environment: devbox-smoke
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_SMOKE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: AMI_ID="${{ needs.build.outputs.ami }}" ./devbox/scripts/smoke-test.sh
+
+  publish:
+    name: publish AMI to SSM
+    needs: [check, build, smoke]
+    # Runs when smoke passed, or when it was deliberately skipped — but never
+    # when it ran and failed.
+    if: always() && needs.build.result == 'success' && needs.smoke.result != 'failure' && needs.smoke.result != 'cancelled'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: |
+          AMI="${{ needs.build.outputs.ami }}"
+          aws ssm put-parameter --name "$AMI_PARAM" --type String \
+            --data-type aws:ec2:image --value "$AMI" --overwrite
+          aws ssm put-parameter --name "$DIGEST_PARAM" --type String \
+            --value "${{ needs.check.outputs.digest }}" --overwrite
+          echo "published $AMI"
+          echo "### devbox AMI \`$AMI\` published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Submit it as a new version with IAM access role \`arn:aws:iam::747712783559:role/AWSMarketplaceAmiIngestion\`." >> "$GITHUB_STEP_SUMMARY"

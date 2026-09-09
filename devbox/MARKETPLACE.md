@@ -72,6 +72,39 @@ done
 Publish each region's AMI id to that region's SSM `/flyte-devbox/ami/latest` (the
 template resolves it via `AmiSsmParameter`). The pipeline does this per build.
 
+## 3a. Marketplace assets (template + diagram)
+
+`scripts/package-marketplace.sh` builds the buyer-facing template and uploads it
+with the architecture diagram to the seller account's asset bucket:
+
+```bash
+AWS_PROFILE=union-seller scripts/package-marketplace.sh
+```
+
+- Bucket: `s3://flyte-marketplace-assets-747712783559`, `devbox/*` is
+  **public-read** by bucket policy (ACL public access stays blocked, and the
+  bucket root is not listable). It has to be: buyers' CloudFormation fetches the
+  nested stack templates from here at launch time.
+- Submit the **versioned** template URL, not `flyte-devbox-latest.yaml` — a
+  listing should not change underneath a version AWS has already reviewed.
+
+### Why the listing template is not root.yaml
+
+The script strips one parameter before packaging:
+
+```yaml
+AmiSsmParameter:
+  Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+  Default: /flyte-devbox/ami/latest
+```
+
+CloudFormation resolves SSM-parameter-typed parameters in the account running
+the stack, referenced or not. Buyers have no `/flyte-devbox/ami/latest`, so every
+launch would fail at parameter resolution — even though Marketplace populates
+`AmiId` and the `HasAmiId` condition would have made the SSM value irrelevant.
+`root.yaml` keeps it, because it is what lets the AMI pipeline publish a new
+image with no template change.
+
 ## 4. CloudFormation product wiring
 
 - The template resolves the AMI from the per-region SSM parameter
@@ -86,7 +119,8 @@ template resolves it via `AmiSsmParameter`). The pipeline does this per build.
 - [ ] Product title, short/long description, categories
 - [ ] Pricing model (BYOL / hourly / free) + EULA
 - [ ] Support details + refund policy
-- [ ] Architecture diagram + usage instructions (link README)
+- [ ] Architecture diagram (`docs/architecture.svg` -> `architecture.png`,
+      uploaded by `scripts/package-marketplace.sh`) + usage instructions
 - [ ] Submit for review (AWS review is typically several business days)
 
 ## Pre-submit gate

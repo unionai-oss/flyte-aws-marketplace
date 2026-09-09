@@ -10,6 +10,15 @@ addon:
   # repository from it and the repository provisioned by the listing is
   # union-ai/flyte-eks-add-on.
   name: flyte-eks-add-on
+
+  # The EKS catalog name, entered as "Add-on name" in the portal and displayed
+  # as <mp-seller-alias>_<addOnName> — so union-ai_flyte. Deliberately NOT the
+  # same as `name` above: that one is forced to the Marketplace ECR repository
+  # because `helm push` derives the repo from the chart name, whereas repeating
+  # "add-on" here would read badly in a console list of add-ons.
+  # Whatever this is, ADDON_PRODUCT_NAME in versions.env must be the full
+  # <seller>_<addOnName>, or the resolver never finds the published add-on.
+  addOnName: flyte
   displayName: "Flyte 2 for Amazon EKS"
   publisher: "Union.ai"
   # Semantic version of the add-on (== wrapper Chart.yaml version == ADDON_VERSION).
