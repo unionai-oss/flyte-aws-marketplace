@@ -34,7 +34,7 @@ flyteBinary:
   deployment:
     image:
       repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-      tag: flyte-binary-v2.0.27-r1
+      tag: flyte-binary-v2.0.48-r1
     # initContainer that waits for Aurora to accept connections.
     waitForDB:
       image:
@@ -80,7 +80,7 @@ flyteBinary:
     co-pilot:
       image:
         repository: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on
-        tag: flyte-binary-v2.0.27-r1
+        tag: flyte-binary-v2.0.48-r1
 
     storage:
       provider: s3

@@ -23,7 +23,7 @@ addon:
   publisher: "Union.ai"
   # Semantic version of the add-on (== wrapper Chart.yaml version == ADDON_VERSION).
   # The portal wants major.minor.patch with no leading "v".
-  version: "0.1.2"
+  version: "0.1.3"
 
   # Add-on category, chosen from the fixed list Marketplace allows for EKS
   # add-on products. Flyte is a workflow orchestrator rather than a cluster
@@ -33,7 +33,7 @@ addon:
   type: kubernetes-management
 
   # The Flyte backend delivered by this version.
-  flyteVersion: "2.0.27"
+  flyteVersion: "2.0.48"
 
   description: >-
     Production Flyte 2 control plane on Amazon EKS. Runs the flyte-binary
@@ -68,7 +68,7 @@ addon:
   configurationSchema: chart/flyte-eks-add-on/aws_mp_configuration_schema.json
 
   # The chart itself, pushed as an OCI artifact by scripts/build-addon.sh.
-  helmChartUri: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:0.1.2
+  helmChartUri: 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:0.1.3
 
   # Every container image the chart renders, after relocation into the
   # Marketplace ECR. This list is entered verbatim in the Add Version request —
@@ -76,7 +76,7 @@ addon:
   # INVALID_HELM_UNDECLARED_IMAGES. Generated from MP_IMAGES in versions.env and
   # cross-checked by scripts/validate.sh.
   images:
-    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-binary-v2.0.27-r1
+    - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-binary-v2.0.48-r1
     - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyteconsole-21b4f4bf69f3538a656effc9c8c95cd1450e2088-r1
     - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:flyte-connectors-py3.12-v2.3.6-r1
     - 709825985650.dkr.ecr.us-east-1.amazonaws.com/union-ai/flyte-eks-add-on:postgres-15-alpine-r1
