@@ -16,16 +16,17 @@ Parameters:
       (10.42.0.0/16) or service CIDR (10.43.0.0/16), or in-cluster DNS will
       route to flannel and break image pulls.
 
+  # No default, deliberately: AWS Marketplace forbids a default CIDR that opens
+  # remote-access ports to the internet, so the buyer has to name their range.
   AllowedCidr:
     Type: String
-    Default: 0.0.0.0/0
     AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
     ConstraintDescription: Must be a CIDR like 1.2.3.4/32 or 10.0.0.0/16
     Description: |
-      CIDR allowed to reach the devbox public ports (80 UI/API, 8081 serving, 5000 docker registry).
-      Use 1.2.3.4/32 for a single laptop, your corporate egress range (e.g. 10.0.0.0/16) for an office,
-      or 0.0.0.0/0 for open access (not recommended for production). To allow multiple ranges, deploy
-      with this set to your primary range and add additional SG ingress rules after launch.
+      REQUIRED. CIDR allowed to reach the devbox public ports (80 UI/API, 8081 serving, 5000 docker registry).
+      Use 1.2.3.4/32 for a single laptop, or your corporate egress range (e.g. 10.0.0.0/16) for an office.
+      0.0.0.0/0 opens the devbox to the entire internet and is not recommended. To allow multiple ranges,
+      deploy with this set to your primary range and add additional SG ingress rules after launch.
       In Prod mode (Domain set), this gates the ALB instead.
       Ignored entirely if NoPublicIngress=Yes.
 

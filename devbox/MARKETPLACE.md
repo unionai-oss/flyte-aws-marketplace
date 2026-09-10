@@ -92,7 +92,10 @@ AWS_PROFILE=union-seller scripts/package-marketplace.sh
 
 ### Why the listing template is not root.yaml
 
-The script strips one parameter before packaging:
+The script rewrites two things, both of which are cases where what the repo wants
+for its own deploys is exactly what Marketplace rejects.
+
+**1. `AmiSsmParameter` is stripped.**
 
 ```yaml
 AmiSsmParameter:
@@ -105,16 +108,45 @@ the stack, referenced or not. Buyers have no `/flyte-devbox/ami/latest`, so ever
 launch would fail at parameter resolution — even though Marketplace populates
 `AmiId` and the `HasAmiId` condition would have made the SSM value irrelevant.
 `root.yaml` keeps it, because it is what lets the AMI pipeline publish a new
-image with no template change.
+image with no template change. (`HasAmiId` is dropped from the variant too, since
+with the SSM parameter gone it selects between nothing.)
+
+**2. Nested `TemplateURL`s are rewritten to the `MPS3*` parameters.**
+
+`root.yaml` uses relative paths so `aws cloudformation package` resolves them for
+our own deploys — but package turns them into hardcoded S3 URLs, and Marketplace
+rejects those. The URLs must be built from three parameters whose names AWS fixes:
+
+```yaml
+TemplateURL: !Sub https://${MPS3BucketName}.s3.${MPS3BucketRegion}.${AWS::URLSuffix}/${MPS3KeyPrefix}compute.yaml
+```
+
+AWS rewrites those defaults when it copies the nested templates into its own
+bucket. So the script uploads the nested templates under **stable names** to
+`devbox/templates/` and does the rewrite itself, rather than calling `package`.
+The uploaded names must stay in step with the `NESTED` table in the script.
 
 ## 4. CloudFormation product wiring
 
-- The template resolves the AMI from the per-region SSM parameter
-  `/flyte-devbox/ami/latest` (override with `AmiId`); no hardcoded id.
-- Confirm no parameters expose secrets; `AllowedCidr` defaults to `0.0.0.0/0`
-  (document tightening it).
-- Validate with the Marketplace template requirements (IAM capabilities,
-  parameter labels/groups via `AWS::CloudFormation::Interface`).
+These are the rules the CloudFormation review actually enforces — each one below
+cost a rejected submission:
+
+- **No default CIDR that opens remote access to the internet.** `AllowedCidr` has
+  no `Default`; buyers must supply their range. Same rule covers database ports
+  and default passwords.
+- **No seller-hosted Lambda code.** Marketplace neither ingests nor scans objects
+  in a seller bucket, so `Code:` pointing at a directory (which
+  `cloudformation package` zips and uploads) counts as an external dependency.
+  Every Lambda here is inline `ZipFile`. This is why the Cognito hosted-UI logo
+  is gone: only the `SetUICustomization` API can set a logo, which needed a
+  Lambda plus a 25 KB PNG, so `common/cloudformation/auth.yaml` uses the native
+  CSS-only `UserPoolUICustomizationAttachment` instead.
+- **Nested templates must be publicly readable** and referenced via `MPS3*` (see
+  above). Check with an unauthenticated `curl` after uploading.
+- The AMI comes from a template parameter (`AmiId`), never a hardcoded id or a
+  community AMI.
+- Parameters are grouped for the console with `AWS::CloudFormation::Interface`,
+  which the variant adds.
 
 ## 5. Listing (Marketplace Management Portal)
 

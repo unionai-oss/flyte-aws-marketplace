@@ -139,48 +139,33 @@ Resources:
         - ALLOW_REFRESH_TOKEN_AUTH
         - ALLOW_USER_SRP_AUTH
 
-  # ---- Hosted-UI branding (logo + colour scheme) ----
-  # CloudFormation's native UICustomizationAttachment only does CSS, not the logo
-  # image, so a tiny custom resource calls SetUICustomization for both. The assets
-  # (login-ui.css + login-logo.png) are bundled beside the handler and uploaded by
-  # `aws cloudformation package`. This lives in the shared auth stack so every
-  # product's login page is branded identically.
-  BrandingRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal: {Service: lambda.amazonaws.com}
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: set-ui-customization
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action: cognito-idp:SetUICustomization
-                Resource: !GetAtt UserPool.Arn
-
-  BrandingFn:
-    Type: AWS::Lambda::Function
-    Properties:
-      Runtime: python3.13
-      Handler: index.handler
-      Timeout: 30
-      Role: !GetAtt BrandingRole.Arn
-      Code: branding
-
-  # Applying UI customization needs the hosted-UI domain to exist first.
+  # ---- Hosted-UI branding (colour scheme) ----
+  # CSS only, and deliberately no logo. Cognito accepts a logo image only through
+  # the SetUICustomization API, which meant a Lambda -- and the 25 KB PNG beside
+  # it -- packaged into a seller S3 bucket. AWS Marketplace rejects that as an
+  # external dependency it can neither ingest nor scan ("Lambda code hosted in
+  # seller S3 buckets are not ingested nor scanned"), so the image went rather
+  # than the review. The native attachment needs no code at all.
+  #
+  # Lives in the shared auth stack so every product's login page matches. Only
+  # Cognito-allowed selectors/properties work here; see docs/brand-palette.md.
   LoginBranding:
-    Type: Custom::CognitoLoginBranding
+    Type: AWS::Cognito::UserPoolUICustomizationAttachment
+    # Customization attaches to the hosted UI, so the domain must exist first.
     DependsOn: UserPoolDomain
     Properties:
-      ServiceToken: !GetAtt BrandingFn.Arn
       UserPoolId: !Ref UserPool
+      ClientId: ALL
+      CSS: |
+        /* Union/Flyte brand — Cognito Hosted UI (light theme, purple accents). */
+        .background-customizable { background-color: #F5F6F8; }        /* grey-95 page */
+        .banner-customizable { background-color: #FCFDFD; }            /* grey-99 banner */
+        .label-customizable { color: #1D1E1F; }                        /* grey-10 text */
+        .textDescription-customizable { color: #434648; }              /* grey-30 */
+        .inputField-customizable { border-color: #B1B5B7; }            /* grey-60 */
+        .inputField-customizable:focus { border-color: #6F43C0; }      /* purple-50 */
+        .submitButton-customizable { background-color: #6F43C0; }      /* purple-50 primary */
+        .submitButton-customizable:hover { background-color: #5A32A4; }/* purple-40 hover */
 
   # Machine-to-machine client for CI (client-credentials). Optional.
   UserPoolClientM2M:
