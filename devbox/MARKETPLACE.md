@@ -54,7 +54,9 @@ In the **AWS Marketplace Management Portal → Products → Server → AMIs**, s
 AMI with the Marketplace account and run the self-service scan. It checks ~30
 items; the ones this build is built to pass:
 - [ ] No hardcoded secrets / access keys (creds come from the instance profile)
-- [ ] No `authorized_keys` / default passwords baked in
+- [ ] No `authorized_keys` / default passwords baked in (the build keypair is
+      removed from `/root` and `/home/*` in the final packer provisioner — a
+      leftover one fails the scan's "Default authorized keys" check)
 - [ ] SSH host keys + machine-id regenerated on boot (cleared in `provision.sh`)
 - [ ] `cloud-init` + SSM agent present and enabled
 - [ ] OS packages reasonably current (`apt-get update` at build)

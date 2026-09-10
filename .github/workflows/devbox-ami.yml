@@ -81,9 +81,18 @@ jobs:
         run: |
           packer init .
           # The build instance needs a public subnet; the seller account's
-          # default VPC provides one in every AZ.
-          SUBNET=$(aws ec2 describe-subnets --filters Name=map-public-ip-on-launch,Values=true \
+          # default VPC provides one in every AZ. Not every AZ offers the build
+          # instance type though — us-east-1e has no m6i, and picking Subnets[0]
+          # blindly lands there and fails RunInstances with `Unsupported` — so
+          # restrict the choice to AZs that actually offer it.
+          TYPE=$(grep -A2 'variable "instance_type"' flyte-devbox.pkr.hcl | sed -n 's/.*default *= *"\(.*\)"/\1/p')
+          AZS=$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
+                  --filters Name=instance-type,Values="$TYPE" \
+                  --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' ',')
+          SUBNET=$(aws ec2 describe-subnets \
+                     --filters Name=map-public-ip-on-launch,Values=true "Name=availability-zone,Values=$AZS" \
                      --query 'Subnets[0].SubnetId' --output text)
+          [ "$SUBNET" != "None" ] || { echo "no public subnet in an AZ offering $TYPE" >&2; exit 1; }
           VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
           echo "building in $VPC / $SUBNET"
           packer build -var subnet_id="$SUBNET" -var vpc_id="$VPC" \

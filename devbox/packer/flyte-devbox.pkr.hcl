@@ -104,4 +104,20 @@ build {
     execute_command = "chmod +x {{ .Path }}; sudo env {{ .Vars }} bash '{{ .Path }}'"
     script          = "provision.sh"
   }
+
+  # Marketplace AMI scan: "Default authorized keys". Packer's throwaway build
+  # keypair is injected into /home/ubuntu/.ssh/authorized_keys, and the Ubuntu
+  # cloud image mirrors it into /root/.ssh/authorized_keys (the "Please login as
+  # ubuntu" entry) — the scanner rejects any authorized key baked into an AMI.
+  # Strip them in the LAST provisioner: after this Packer only reuses the SSH
+  # connection it already holds, and cloud-init recreates the file from the
+  # launch keypair on first boot. The product itself needs no SSH — operator
+  # access is via SSM (see scripts/dev-sync.sh).
+  provisioner "shell" {
+    execute_command = "chmod +x {{ .Path }}; sudo bash '{{ .Path }}'"
+    inline = [
+      "rm -f /root/.ssh/authorized_keys /home/*/.ssh/authorized_keys",
+      "if find /root /home -name authorized_keys | grep -q .; then echo 'authorized_keys still baked into the image' >&2; exit 1; fi",
+    ]
+  }
 }
