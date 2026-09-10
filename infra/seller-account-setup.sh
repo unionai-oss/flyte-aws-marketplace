@@ -7,7 +7,10 @@
 #   done  OIDC provider for GitHub Actions
 #   done  AWSMarketplaceAmiIngestion role (lets Marketplace copy + scan AMIs)
 #   done  s3://flyte-marketplace-assets-747712783559 (+ public read on devbox/*)
-#   TODO  github-actions-flyte-marketplace role  <- this script
+#   done  mp.flytedemo.app hosted zone, delegated by NS from the flytedemo.app
+#         zone in 371290552455 — gives CI smoke stacks a namespace of their own
+#         so they never deploy into a personal domain
+#   this  github-actions-flyte-marketplace + github-actions-flyte-devbox-smoke
 #
 # Usage: AWS_PROFILE=union-seller infra/seller-account-setup.sh
 set -euo pipefail
@@ -73,10 +76,43 @@ cat > "${WORK}/perms.json" <<EOF
 }
 EOF
 
-aws iam create-role --role-name github-actions-flyte-marketplace \
-  --description "GitHub Actions OIDC: devbox AMI builds + EKS add-on publishing" \
-  --assume-role-policy-document "file://${WORK}/trust.json" \
-  --query 'Role.Arn' --output text
+# Trust for the smoke role: the devbox-smoke ENVIRONMENT only, never a branch.
+# The environment is what carries the required-reviewer gate, so scoping the
+# trust to it means an unreviewed run cannot assume a role this broad.
+cat > "${WORK}/trust-smoke.json" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Federated": "arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com" },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+        "token.actions.githubusercontent.com:sub": "repo:${REPO}:environment:devbox-smoke"
+      }
+    }
+  }]
+}
+EOF
+
+# Idempotent: re-running must be a no-op, not a CreateRole collision. The trust
+# policy is refreshed either way, so a changed REPO or ACCOUNT actually lands.
+ensure_role() {
+  local name="$1" trust="$2" desc="$3"
+  if aws iam get-role --role-name "${name}" >/dev/null 2>&1; then
+    echo ">> ${name} exists — refreshing trust policy"
+    aws iam update-assume-role-policy --role-name "${name}" --policy-document "file://${trust}"
+  else
+    echo ">> creating ${name}"
+    aws iam create-role --role-name "${name}" --description "${desc}" \
+      --assume-role-policy-document "file://${trust}" --query 'Role.Arn' --output text
+  fi
+}
+
+# ---- 1. publishing role: AMI builds + add-on publishing --------------------
+ensure_role github-actions-flyte-marketplace "${WORK}/trust.json" \
+  "GitHub Actions OIDC: devbox AMI builds + EKS add-on publishing"
 
 # Packer needs to run an instance, snapshot it, and register an AMI. EC2 full
 # access is the usual grant; scope it down with a permissions boundary if your
@@ -88,7 +124,28 @@ aws iam put-role-policy --role-name github-actions-flyte-marketplace \
   --policy-name flyte-marketplace-publish \
   --policy-document "file://${WORK}/perms.json"
 
+# ---- 2. smoke-test role: deploys a whole throwaway devbox stack ------------
+# Deliberately broad. The smoke test stands up CloudFormation, EC2, Aurora, an
+# ALB, Cognito and the stack's own IAM roles and then tears it all down;
+# enumerating that surface as a least-privilege policy is a losing game that
+# breaks on every template change. The controls that matter are elsewhere: the
+# trust policy admits only the devbox-smoke environment, and that environment
+# carries required reviewers. Keep it that way — without the reviewer gate this
+# is a near-admin credential reachable from a workflow file.
+ensure_role github-actions-flyte-devbox-smoke "${WORK}/trust-smoke.json" \
+  "GitHub Actions OIDC: devbox smoke test (full stack deploy + teardown)"
+
+aws iam attach-role-policy --role-name github-actions-flyte-devbox-smoke \
+  --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+aws iam attach-role-policy --role-name github-actions-flyte-devbox-smoke \
+  --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+
 echo
-echo "Now set the repo variable so the workflows can find it:"
+echo "Now set the repo variables so the workflows can find the roles:"
 echo "  gh variable set AWS_PUBLISH_ROLE_ARN --repo ${REPO} \\"
 echo "    --body arn:aws:iam::${ACCOUNT}:role/github-actions-flyte-marketplace"
+echo "  gh variable set AWS_SMOKE_ROLE_ARN --repo ${REPO} \\"
+echo "    --body arn:aws:iam::${ACCOUNT}:role/github-actions-flyte-devbox-smoke"
+echo
+echo "And put REQUIRED REVIEWERS on the devbox-smoke environment before the"
+echo "first run — see the comment above the smoke role."

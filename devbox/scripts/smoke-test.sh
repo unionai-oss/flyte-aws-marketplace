@@ -10,9 +10,13 @@
 # provider), Knative/Kourier config-domain, and *.apps.<Domain> ALB routing.
 # It needs docker on the runner; without docker the app step is skipped (loudly).
 #
-# Required env (have sane defaults for the union-presales account):
+# Required env (defaults target the Marketplace SELLER account, 747712783559):
 #   DOMAIN          fully-qualified name for the test stack (its Route 53 zone is
 #                   auto-discovered by the template — no zone id needed)
+#
+#                   The default sits under mp.flytedemo.app, a zone delegated to
+#                   the seller account so CI never deploys into anyone's personal
+#                   namespace. Override DOMAIN to run against a zone you own.
 # Optional:
 #   STACK_NAME (default flyte-devbox-smoke)  REGION (us-east-1)
 #   AWS_PROFILE (unset => ambient creds)     AMI_ID (override template default)
@@ -20,7 +24,7 @@ set -euo pipefail
 
 STACK_NAME="${STACK_NAME:-flyte-devbox-smoke}"
 REGION="${REGION:-us-east-1}"
-DOMAIN="${DOMAIN:-smoke.flytedemo.app}"
+DOMAIN="${DOMAIN:-smoke.mp.flytedemo.app}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TEMPLATE="$ROOT/cloudformation/root.yaml"
 AWSP=(); [ -n "${AWS_PROFILE:-}" ] && AWSP=(--profile "$AWS_PROFILE")
