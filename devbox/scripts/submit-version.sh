@@ -40,9 +40,10 @@
 #   DRY_RUN=1 scripts/submit-version.sh          # print the change set, send nothing
 #   VALIDATE_ONLY=1 scripts/submit-version.sh    # run AWS's validation, create nothing
 #
-# VALIDATE_ONLY is worth the extra minute. It runs the same server-side checks as
-# a real submission under Intent=VALIDATE without consuming a version title or
-# producing a rejection on the listing's record.
+# VALIDATE_ONLY is worth the extra minute in ADD mode: it runs the same
+# server-side checks as a real submission under Intent=VALIDATE without
+# consuming a version title. It does not exist in update mode - AWS rejects
+# Intent for UpdateDeliveryOptions - where DRY_RUN=1 is the dry run instead.
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/versions.env"
@@ -300,33 +301,64 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-submit() {  # $1 = Intent
+# Intent is accepted per change type, not per API. AWS rejects it outright for
+# UpdateDeliveryOptions on AmiProduct@1.0 -
+#   "Intent not supported for change type 'UpdateDeliveryOptions'"
+# - so update mode has to submit with no --intent at all, and gets no
+# server-side rehearsal. Pass "" to omit it.
+submit() {  # $1 = Intent, or "" for none
+  local intent=()
+  [[ -n "$1" ]] && intent=(--intent "$1")
+  # ${arr[@]+...} because bash 3.2 (macOS) treats an empty array as unbound
+  # under `set -u`.
   aws marketplace-catalog start-change-set --catalog AWSMarketplace \
     --region "${AWS_REGION}" \
     --change-set-name "${CHANGE_SET_NAME}" \
     --change-set "${CHANGE_SET}" \
-    --intent "$1" \
+    ${intent[@]+"${intent[@]}"} \
     --query ChangeSetId --output text
 }
 
-# Intent=VALIDATE runs AWS's own checks without creating the version. Always do
-# it first — it costs a minute and catches the mistakes that otherwise surface
-# as an asynchronous rejection against a version title that is now spent.
-echo ">> validating (Intent=VALIDATE)"
-VALIDATE_ID="$(submit VALIDATE)"
-echo "   validation change set: ${VALIDATE_ID}"
-aws marketplace-catalog describe-change-set --catalog AWSMarketplace \
-  --region "${AWS_REGION}" --change-set-id "${VALIDATE_ID}" \
-  --query '{status:Status,errors:ChangeSet[].ErrorDetailList}' --output json
+if [[ "${MODE}" == "add" ]]; then
+  # Intent=VALIDATE runs AWS's own checks without creating the version. Always do
+  # it first in add mode - it costs a minute and catches the mistakes that
+  # otherwise surface as an asynchronous rejection against a version title that
+  # is now spent.
+  echo ">> validating (Intent=VALIDATE)"
+  VALIDATE_ID="$(submit VALIDATE)"
+  echo "   validation change set: ${VALIDATE_ID}"
+  aws marketplace-catalog describe-change-set --catalog AWSMarketplace \
+    --region "${AWS_REGION}" --change-set-id "${VALIDATE_ID}" \
+    --query '{status:Status,errors:ChangeSet[].ErrorDetailList}' --output json
 
-if [[ "${VALIDATE_ONLY:-0}" == "1" ]]; then
-  echo ">> VALIDATE_ONLY=1 — validation submitted, no version created."
-  echo "   Validation is asynchronous; poll the change set above until it leaves PREPARING."
-  exit 0
+  if [[ "${VALIDATE_ONLY:-0}" == "1" ]]; then
+    echo ">> VALIDATE_ONLY=1 - validation submitted, no version created."
+    echo "   Validation is asynchronous; poll the change set above until it leaves PREPARING."
+    exit 0
+  fi
+
+  echo ">> submitting (Intent=APPLY)"
+  ID="$(submit APPLY)"
+else
+  if [[ "${VALIDATE_ONLY:-0}" == "1" ]]; then
+    cat >&2 <<'NOVALIDATE'
+>> VALIDATE_ONLY is not available in update mode. NOTHING WAS SUBMITTED.
+
+   AWS does not accept Intent for UpdateDeliveryOptions on AmiProduct@1.0, so
+   there is no server-side rehearsal for this change type.
+
+   Use DRY_RUN=1 to inspect the exact change set without sending it, then re-run
+   without VALIDATE_ONLY to apply.
+
+   Update is the cheap direction: it consumes no version title, so a rejection
+   can be corrected and resubmitted against the same version.
+NOVALIDATE
+    exit 0
+  fi
+
+  echo ">> submitting (no Intent - not supported for UpdateDeliveryOptions)"
+  ID="$(submit "")"
 fi
-
-echo ">> submitting (Intent=APPLY)"
-ID="$(submit APPLY)"
 
 cat <<EOF
 
@@ -336,7 +368,7 @@ cat <<EOF
        --change-set-id ${ID} --region ${AWS_REGION} \\
        --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'
 
-   Validation takes minutes to hours.
+   Review takes minutes to hours.
    ${MODE} mode: $( [[ "${MODE}" == "add" ]] \
      && echo "a rejection consumes the version title \"${VERSION_TITLE}\" permanently - the next attempt needs a new AMI or an explicit VERSION_TITLE." \
      || echo "no version title is consumed; a rejection can be corrected and resubmitted against the same version." )
