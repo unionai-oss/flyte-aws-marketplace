@@ -140,18 +140,115 @@ aws iam put-role-policy --role-name github-actions-flyte-marketplace \
 # ---- 2. smoke-test role: deploys a whole throwaway devbox stack ------------
 # Deliberately broad. The smoke test stands up CloudFormation, EC2, Aurora, an
 # ALB, Cognito and the stack's own IAM roles and then tears it all down;
-# enumerating that surface as a least-privilege policy is a losing game that
-# breaks on every template change. The controls that matter are elsewhere: the
-# trust policy admits only the devbox-smoke environment, and that environment
-# carries required reviewers. Keep it that way — without the reviewer gate this
-# is a near-admin credential reachable from a workflow file.
+# enumerating every resource type as an allow-list is a losing game that breaks
+# on every template change, so the breadth stays: PowerUserAccess covers the
+# stack's EC2/RDS/ELB/Cognito/Route53 surface.
+#
+# What does NOT stay is IAMFullAccess. It was the reason this role needed a human
+# gate - it can mint an admin role and hand it to an instance - and it was far
+# wider than the job requires. CloudFormation auto-names the stack's roles from
+# the stack name, so every IAM object the smoke test touches is
+# flyte-devbox-smoke-*, and the IAM grant is scoped to exactly that.
+#
+# A deny-list then protects the things whose loss would actually hurt, none of
+# which the smoke test has any business touching: the Marketplace asset bucket,
+# the published AMI pointers, the Catalog API, the CI identities themselves, and
+# any region other than the one it deploys into.
 ensure_role github-actions-flyte-devbox-smoke "${WORK}/trust-smoke.json" \
   "GitHub Actions OIDC: devbox smoke test (full stack deploy + teardown)"
 
 aws iam attach-role-policy --role-name github-actions-flyte-devbox-smoke \
   --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
-aws iam attach-role-policy --role-name github-actions-flyte-devbox-smoke \
-  --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+
+# Idempotent downgrade: earlier revisions of this script attached IAMFullAccess.
+if aws iam list-attached-role-policies --role-name github-actions-flyte-devbox-smoke \
+     --query 'AttachedPolicies[?PolicyName==`IAMFullAccess`]' --output text | grep -q IAMFullAccess; then
+  echo ">> detaching IAMFullAccess from the smoke role (replaced by a scoped grant)"
+  aws iam detach-role-policy --role-name github-actions-flyte-devbox-smoke \
+    --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+fi
+
+cat > "${WORK}/smoke-iam.json" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "StackOwnedIamOnly",
+      "Effect": "Allow",
+      "Action": ["iam:CreateRole", "iam:DeleteRole", "iam:GetRole", "iam:TagRole", "iam:UntagRole",
+                 "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy",
+                 "iam:DeleteRolePolicy", "iam:GetRolePolicy", "iam:ListRolePolicies",
+                 "iam:ListAttachedRolePolicies", "iam:UpdateAssumeRolePolicy", "iam:PassRole",
+                 "iam:CreateInstanceProfile", "iam:DeleteInstanceProfile", "iam:GetInstanceProfile",
+                 "iam:AddRoleToInstanceProfile", "iam:RemoveRoleFromInstanceProfile",
+                 "iam:TagInstanceProfile"],
+      "Resource": [
+        "arn:aws:iam::${ACCOUNT}:role/flyte-devbox-smoke-*",
+        "arn:aws:iam::${ACCOUNT}:instance-profile/flyte-devbox-smoke-*"
+      ]
+    },
+    {
+      "Sid": "ServiceLinkedRolesForTheStack",
+      "Effect": "Allow",
+      "Action": ["iam:CreateServiceLinkedRole", "iam:ListRoles", "iam:ListInstanceProfiles"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NoPrivilegedPolicyAttachment",
+      "Effect": "Deny",
+      "Action": ["iam:AttachRolePolicy", "iam:AttachUserPolicy", "iam:AttachGroupPolicy"],
+      "Resource": "*",
+      "Condition": {"ArnLike": {"iam:PolicyARN": [
+        "arn:aws:iam::aws:policy/AdministratorAccess",
+        "arn:aws:iam::aws:policy/IAMFullAccess",
+        "arn:aws:iam::aws:policy/PowerUserAccess"
+      ]}}
+    },
+    {
+      "Sid": "KeepAwayFromTheCiIdentities",
+      "Effect": "Deny",
+      "Action": ["iam:*"],
+      "Resource": [
+        "arn:aws:iam::${ACCOUNT}:role/github-actions-flyte-marketplace",
+        "arn:aws:iam::${ACCOUNT}:role/github-actions-flyte-devbox-smoke",
+        "arn:aws:iam::${ACCOUNT}:role/AWSMarketplaceAmiIngestion",
+        "arn:aws:iam::${ACCOUNT}:oidc-provider/token.actions.githubusercontent.com"
+      ]
+    },
+    {
+      "Sid": "KeepAwayFromMarketplaceArtifacts",
+      "Effect": "Deny",
+      "Action": ["s3:DeleteBucket", "s3:DeleteObject", "s3:DeleteObjectVersion",
+                 "s3:PutBucketPolicy", "s3:PutObject"],
+      "Resource": ["arn:aws:s3:::flyte-marketplace-assets-${ACCOUNT}",
+                   "arn:aws:s3:::flyte-marketplace-assets-${ACCOUNT}/*"]
+    },
+    {
+      "Sid": "KeepAwayFromThePublishedAmiPointers",
+      "Effect": "Deny",
+      "Action": ["ssm:PutParameter", "ssm:DeleteParameter", "ssm:DeleteParameters"],
+      "Resource": "arn:aws:ssm:*:${ACCOUNT}:parameter/flyte-devbox/*"
+    },
+    {
+      "Sid": "NoMarketplacePublishing",
+      "Effect": "Deny",
+      "Action": ["aws-marketplace:*"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "OneRegionOnly",
+      "Effect": "Deny",
+      "NotAction": ["iam:*", "sts:*", "cloudfront:*", "route53:*", "s3:*", "support:*"],
+      "Resource": "*",
+      "Condition": {"StringNotEquals": {"aws:RequestedRegion": "us-east-1"}}
+    }
+  ]
+}
+EOF
+
+aws iam put-role-policy --role-name github-actions-flyte-devbox-smoke \
+  --policy-name flyte-devbox-smoke-guardrails \
+  --policy-document "file://${WORK}/smoke-iam.json"
 
 echo
 echo "Now set the repo variables so the workflows can find the roles:"

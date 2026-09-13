@@ -25,12 +25,9 @@ Both authenticate with OIDC — no long-lived AWS keys.
      is a repo variable only so the workflow does not need a repo edit to move
      between a limited and a public listing.
 3. Environments:
-   - `marketplace-publish` — put required reviewers on it. Submitting a version
-     is irreversible and a rejection burns a chart tag.
-   - `devbox-smoke` — gates real AWS spend, **and** is the only thing standing
-     between a workflow file and a near-admin role. Required reviewers here are
-     load-bearing, not decoration: the smoke role's trust policy names this
-     environment as its sole subject.
+   - `marketplace-publish` and `devbox-smoke` — both exist so the workflow can
+     reference them. Whether they carry required reviewers is a judgement call;
+     see **Unattended runs** below.
 
 Everything runs in the seller account (747712783559) — that is where Marketplace
 requires the artifacts to live, so nothing here touches union-presales.
@@ -83,11 +80,45 @@ creates nothing; use it as a rehearsal before spending a version title.
 
 The smoke test deploys a whole devbox stack — EC2, Aurora, ALB, Cognito, IAM —
 which needs far broader rights than publishing does. Putting that on the
-publishing role would mean every scheduled AMI build ran with near-admin
-credentials, so it is a separate principal
-(`github-actions-flyte-devbox-smoke`, `PowerUserAccess` + `IAMFullAccess`)
-trusted **only** from the `devbox-smoke` environment.
+publishing role would mean every scheduled AMI build ran with those credentials,
+so it is a separate principal (`github-actions-flyte-devbox-smoke`) trusted
+**only** from the `devbox-smoke` environment.
+
+## Unattended runs
+
+The smoke role used to carry `PowerUserAccess` **+ `IAMFullAccess`**, and a
+required reviewer on `devbox-smoke` was the only thing between a workflow file
+and a credential that could mint an admin role. That gate was load-bearing
+because the role was over-powered — so the role got fixed instead.
+
+It now has `PowerUserAccess` plus a scoped grant. CloudFormation auto-names the
+stack's IAM objects from the stack name, so the IAM permissions are limited to
+`flyte-devbox-smoke-*` and nothing else, and a deny-list keeps it away from the
+things whose loss would actually hurt:
+
+| denied | why |
+|---|---|
+| attaching `AdministratorAccess` / `IAMFullAccess` / `PowerUserAccess` | closes the escalate-then-pass route |
+| any `iam:*` on the two CI roles, the ingestion role, the OIDC provider | it cannot rewrite the identities that trust it |
+| writes/deletes on `flyte-marketplace-assets-*` | listing artifacts are not its business |
+| `ssm:PutParameter`/`DeleteParameter` on `/flyte-devbox/*` | only the publish job moves the AMI pointer |
+| `aws-marketplace:*` | it cannot submit, restrict or alter a listing |
+| any region but `us-east-1` | bounds a runaway to one region |
+
+With that in place the reviewer on `devbox-smoke` is a spend control rather than
+a security control, and removing it is a reasonable trade for unattended runs.
+`marketplace-publish` is likewise less load-bearing than it was: the submit
+script now waits for `Intent=VALIDATE` to come back `SUCCEEDED` before it applies
+anything, so a bad payload is caught before a version exists.
+
+**Order matters.** Re-run `infra/seller-account-setup.sh` (it detaches
+`IAMFullAccess` and installs the guardrails) *before* removing the reviewer from
+`devbox-smoke`. Removing the gate first leaves the old, over-powered role
+ungated.
+
+What a reviewer still buys you: the smoke test spends real money (Aurora, an ALB,
+an EC2, ~30 minutes), and nothing here caps that.
 
 Run with `skip_smoke: true` to bypass it — that publishes an unvalidated AMI to
-SSM, which is exactly what the gate exists to prevent, so treat it as a
+SSM, which is exactly what the smoke test exists to prevent, so treat it as a
 break-glass option rather than a convenience.
