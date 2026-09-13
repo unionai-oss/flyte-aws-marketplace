@@ -265,14 +265,14 @@ aws iam put-role-policy --role-name github-actions-flyte-devbox-smoke \
 # One MONTHLY COST budget of $100 with alerts at 50% ($50) and 100% ($100), plus
 # a forecast alert so it warns on the way there rather than after the fact.
 #
-# The notification address is not baked in - pass it:
-#   BUDGET_EMAIL=you@example.com AWS_PROFILE=union-seller infra/seller-account-setup.sh
-BUDGET_EMAIL="${BUDGET_EMAIL:-}"
+# Alerts go to the team alias, not an individual, so they survive someone being
+# on holiday. Override for a personal account with BUDGET_EMAIL=..., or set it
+# empty (BUDGET_EMAIL=) to skip the alarms entirely.
+BUDGET_EMAIL="${BUDGET_EMAIL-sales@union.ai}"
 BUDGET_NAME="flyte-marketplace-monthly"
 if [ -z "${BUDGET_EMAIL}" ]; then
   echo
-  echo ">> BUDGET_EMAIL not set — skipping the cost alarms."
-  echo "   Re-run with BUDGET_EMAIL=you@example.com to create them."
+  echo ">> BUDGET_EMAIL is empty — skipping the cost alarms."
 else
   cat > "${WORK}/budget.json" <<EOF
 {

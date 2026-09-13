@@ -119,10 +119,13 @@ ungated.
 The spend that the reviewer also used to watch is covered by a budget instead.
 `infra/seller-account-setup.sh` creates a monthly cost budget of $100 alerting at
 50% ($50) and 100% ($100), plus a forecast alert so it warns on the way there
-rather than after the fact. Pass the address — it is deliberately not baked in:
+rather than after the fact. Alerts go to **sales@union.ai** — a team alias rather
+than an individual, so they survive someone being away:
 
 ```bash
-BUDGET_EMAIL=you@example.com AWS_PROFILE=union-seller infra/seller-account-setup.sh
+AWS_PROFILE=union-seller infra/seller-account-setup.sh                  # alerts -> sales@union.ai
+BUDGET_EMAIL=you@example.com AWS_PROFILE=union-seller infra/…           # personal account
+BUDGET_EMAIL= AWS_PROFILE=union-seller infra/…                          # skip the alarms
 ```
 
 AWS emails a confirmation for a new subscriber address; accept it or the alerts
