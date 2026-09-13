@@ -27,6 +27,11 @@ on:
         description: "With submit: run AWS's validation (Intent=VALIDATE) without creating a version"
         type: boolean
         default: false
+      mode:
+        description: "With submit: auto picks add-vs-update from the listing (AWS forbids reusing an AMI across versions)"
+        type: choice
+        options: [auto, add, update]
+        default: auto
 
 permissions:
   contents: read
@@ -158,10 +163,11 @@ jobs:
     name: submit version to AWS Marketplace
     needs: [check, build, publish]
     # always() because the common case is a template- or listing-copy-only
-    # version: no new devbox image, so check says build=false and build/publish
+    # change: no new devbox image, so check says build=false and build/publish
     # both skip. A skipped dependency is not a failed one, and submit-version.sh
-    # falls back to the AMI id in SSM when the build job produced none — so this
-    # still submits the current, smoke-tested AMI against the new template.
+    # falls back to the AMI id in SSM when the build job produced none. It then
+    # resolves add-vs-update against the listing itself — that AMI is already on
+    # a version, so the only legal action is to update it in place.
     if: always() && inputs.submit && needs.build.result != 'failure' && needs.publish.result != 'failure'
     runs-on: ubuntu-latest
     environment: marketplace-publish     # required reviewers live here
@@ -184,4 +190,5 @@ jobs:
           # validated AMI id from SSM.
           AMI_ID: ${{ needs.build.outputs.ami }}
           VALIDATE_ONLY: ${{ inputs.validate_only && '1' || '0' }}
+          MODE: ${{ inputs.mode }}
         run: devbox/scripts/submit-version.sh
