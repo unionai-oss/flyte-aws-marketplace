@@ -51,6 +51,32 @@ NESTED=(
   "templates/compute.yaml|compute.yaml"
 )
 
+# `validate-template --template-body` caps at 51200 bytes, and compute.yaml went
+# past that when Spot landed. Anything larger has to be validated from S3, so
+# stage it under a .staging/ key and validate by URL. The staging copy is NOT
+# promoted to the name buyers' nested TemplateURLs resolve to - the real upload
+# below does that, only after validation passes, so a broken template never sits
+# at the real name even briefly. Staging objects are left in place and
+# overwritten each run: deleting them would need s3:DeleteObject, which the
+# publishing role does not have and does not need.
+INLINE_TEMPLATE_MAX=51200
+validate_template() {   # <local file> <label for the staging key>
+  local src="$1" label="$2" size key rc=0
+  size="$(wc -c < "${src}" | tr -d ' ')"
+  if [[ "${size}" -le "${INLINE_TEMPLATE_MAX}" ]]; then
+    aws cloudformation validate-template --template-body "file://${src}" \
+      --region "${REGION}" >/dev/null
+    return $?
+  fi
+  key="${KEY_PREFIX}.staging/${label}"
+  echo "   ${label} is ${size} B (> ${INLINE_TEMPLATE_MAX}); validating via s3://${BUCKET}/${key}"
+  aws s3 cp "${src}" "s3://${BUCKET}/${key}" --region "${REGION}" >/dev/null || return 1
+  aws cloudformation validate-template \
+    --template-url "https://${BUCKET}.s3.${REGION}.amazonaws.com/${key}" \
+    --region "${REGION}" >/dev/null || rc=$?
+  return "${rc}"
+}
+
 echo ">> [1/4] rewrite root.yaml into the buyer-facing variant"
 python3 - "${REPO_ROOT}/cloudformation/root.yaml" "${WORK}/root.yaml" \
          "${BUCKET}" "${REGION}" "${KEY_PREFIX}" <<'PY'
@@ -175,16 +201,14 @@ for row in "${NESTED[@]}"; do
   rel="${row%%|*}"; name="${row##*|}"
   src="${REPO_ROOT}/cloudformation/${rel}"
   [[ -f "${src}" ]] || { echo "missing nested template: ${src}" >&2; exit 1; }
-  aws cloudformation validate-template --template-body "file://${src}" \
-    --region "${REGION}" >/dev/null \
+  validate_template "${src}" "${name}" \
     || { echo "nested template failed validate-template: ${name}" >&2; exit 1; }
   aws s3 cp "${src}" "s3://${BUCKET}/${KEY_PREFIX}${name}" --region "${REGION}" >/dev/null
   echo "   ${name}"
 done
 
 echo ">> [3/4] validate + upload the root template"
-aws cloudformation validate-template \
-  --template-body "file://${WORK}/root.yaml" --region "${REGION}" >/dev/null \
+validate_template "${WORK}/root.yaml" "root.yaml" \
   || { echo "root template failed validate-template" >&2; exit 1; }
 
 VERSION="$(date +%Y%m%d%H%M%S)"

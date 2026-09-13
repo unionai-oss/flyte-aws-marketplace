@@ -171,6 +171,24 @@ cost a rejected submission:
   they launched our seller-bucket URL directly rather than the ingested
   Marketplace version; AWS rewrites that default to its own bucket on ingestion.
 
+### A note on template size
+
+`validate-template --template-body` caps at **51,200 bytes**. `compute.yaml`
+crossed that when Spot landed (it is now ~55 KB), which failed the packaging step
+with a `Member must have length less than or equal to 51200` constraint error
+rather than anything that mentioned size limits.
+
+`package-marketplace.sh` now picks the validation method by file size: under the
+cap it validates inline, over it stages the file to `<prefix>.staging/` and
+validates by URL. The staging copy is never promoted to the name buyers' nested
+`TemplateURL`s resolve to - the real upload happens afterwards, only once
+validation passes. Staging objects are left in place and overwritten each run;
+deleting them would need `s3:DeleteObject`, which the publishing role does not
+have and does not need.
+
+The separate 1 MB ceiling on S3-hosted templates is far away, and the 16 KB
+base64 cap on EC2 user-data is checked by `scripts/validate.sh`.
+
 ## 3b. Submitting the version
 
 `scripts/submit-version.sh` builds the `AddDeliveryOptions` change set and sends
