@@ -59,13 +59,33 @@ Set AutoStop to No for an always-on deployment. Aurora Serverless v2 scales to
 zero on the secure route, so an idle stack costs storage plus the load balancer
 and, if you allocated one, the Elastic IP.
 
-5. TEARDOWN
+5. RUNNING ON SPOT (OPTIONAL)
+
+Set UseSpot to Yes to run the devbox on a Spot instance. It is much cheaper than
+on-demand, and the gap is largest on GPU instance types, but AWS can reclaim the
+capacity at any time.
+
+Being reclaimed STOPS the devbox rather than terminating it - the same thing the
+idle auto-stop already does. The data volume, the instance ID, the Elastic IP and
+the load balancer registration all survive, and the devbox comes back when
+capacity returns.
+
+What does not survive is work in flight. A running task is killed and restarted
+from the beginning, so a long training run can lose hours. A Spot devbox can also
+sit stopped for a while waiting for capacity, in which case the wake page tells
+you so. Use Spot for interactive and batch work you can afford to repeat; use
+on-demand for a long unattended run you need to finish on a deadline.
+
+You can move an existing deployment either way by updating the stack with a
+different UseSpot value.
+
+6. TEARDOWN
 
 Delete the stack. The S3 bucket, the Aurora cluster, the ECR repository and the
 backup vault are retained on purpose - they hold real data and images. Delete
 them separately once you are sure you no longer need them.
 
-6. SUPPORT
+7. SUPPORT
 
 Documentation: https://www.union.ai/docs/v2/
 Flyte community: https://slack.flyte.org

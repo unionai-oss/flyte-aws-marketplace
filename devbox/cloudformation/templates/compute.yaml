@@ -35,6 +35,11 @@ Parameters:
     Type: String
     Default: "No"
     AllowedValues: ["Yes", "No"]
+  UseSpot:
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes", "No"]
+    Description: Run the EC2 as a persistent Spot request with stop-on-interruption.
   StableIp:
     Type: String
     Default: "Yes"
@@ -111,6 +116,7 @@ Conditions:
     - !Equals [!Ref NoPublicIngress, "No"]
     - !Equals [!Ref StableIp, "Yes"]
   WantsAutoStop: !Equals [!Ref AutoStop, "Yes"]
+  IsSpot: !Equals [!Ref UseSpot, "Yes"]
   WantsProdWake: !And
     - !Not [!Equals [!Ref Domain, ""]]
     - !Equals [!Ref AutoStop, "Yes"]
@@ -137,6 +143,19 @@ Resources:
           HttpPutResponseHopLimit: 3
           HttpEndpoint: enabled
         SecurityGroupIds: [!Ref InstanceSecurityGroupId]
+        # Spot. persistent + stop, never the one-time + terminate default:
+        # terminate deletes the root volume and drops the instance id, which
+        # takes the EIP association and the ALB target registration with it.
+        # With stop an interruption is just a stop, which the idle agent already
+        # does routinely, and RunInstances only accepts persistent when the
+        # interruption behaviour is hibernate or stop.
+        InstanceMarketOptions: !If
+          - IsSpot
+          - MarketType: spot
+            SpotOptions:
+              SpotInstanceType: persistent
+              InstanceInterruptionBehavior: stop
+          - !Ref AWS::NoValue
         BlockDeviceMappings:
           - DeviceName: /dev/sda1
             Ebs:
@@ -167,9 +186,9 @@ Resources:
                 INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
 
                 # Self-attach the data volume by ID (no CFN attachment -> instance is
-                # freely replaceable). It holds the durable Flyte storage; Docker's
-                # image root stays on the AMI root volume (baked images). Best-effort;
-                # prod state is external (Aurora/S3).
+                # freely replaceable). It holds the durable Flyte storage AND, after
+                # the migration below, docker's data-root - which is where k3s state
+                # actually lives. Best-effort; prod state is external (Aurora/S3).
                 mkdir -p /var/lib/flyte-data
                 for i in $(seq 1 60); do
                   owner=$(aws ec2 describe-volumes --volume-ids "$DATA_VOLUME_ID" --region "$AWS_REGION" --query 'Volumes[0].Attachments[0].InstanceId' --output text 2>/dev/null || echo "")
@@ -187,6 +206,55 @@ Resources:
                 fi
                 mkdir -p /var/lib/flyte-data/storage
 
+                # Move docker's data-root onto the data volume. This matters more
+                # than it looks: k3s state lives in the `flyte-k3s-data` NAMED
+                # docker volume, which sits under docker's data-root. With docker's
+                # default root the whole cluster - FlyteWorkflow CRDs, the embedded
+                # datastore, the image cache - sat on the root volume, which has
+                # DeleteOnTermination: true and is NOT the volume AWS Backup
+                # snapshots. So the nightly backup captured storage/ and nothing
+                # else, and any instance replacement discarded the cluster.
+                #
+                # Runs before the GPU block on purpose: nvidia-ctk merges into
+                # daemon.json and restarts docker, so it must see the final root.
+                # No-op when the data volume is absent - docker stays on root, which
+                # is the best available answer for an unattached-volume boot.
+                if mountpoint -q /var/lib/flyte-data; then
+                  if [ ! -d /var/lib/flyte-data/docker ]; then
+                    echo "moving docker data-root onto the data volume (one time)"
+                    systemctl stop docker docker.socket >/dev/null 2>&1 || true
+                    mkdir -p /var/lib/flyte-data/docker
+                    # tar, not cp or rsync: overlay2 depends on hardlinks and
+                    # xattrs (cp -a drops hardlinks), and rsync is not in the AMI.
+                    # A failed copy is recoverable - an empty data-root just means
+                    # `docker run` pulls the devbox image on first start - but a
+                    # half-copied one is not, so wipe it rather than leave a
+                    # corrupt store behind.
+                    if ! tar -C /var/lib/docker --xattrs --xattrs-include='*' -cpf - . \
+                         | tar -C /var/lib/flyte-data/docker --xattrs --xattrs-include='*' -xpf - ; then
+                      echo "docker data-root copy failed; starting empty (image will be re-pulled)"
+                      rm -rf /var/lib/flyte-data/docker
+                      mkdir -p /var/lib/flyte-data/docker
+                    fi
+                  fi
+                  if ! grep -qs '"data-root"' /etc/docker/daemon.json; then
+                    systemctl stop docker docker.socket >/dev/null 2>&1 || true
+                    mkdir -p /etc/docker
+                    # jq (baked into the AMI) rather than a python heredoc: heredoc
+                    # bodies keep their indentation, which python rejects. Merge so
+                    # a daemon.json the AMI already wrote survives.
+                    if [ -f /etc/docker/daemon.json ]; then
+                      jq '. + {"data-root":"/var/lib/flyte-data/docker"}' /etc/docker/daemon.json > /etc/docker/daemon.json.new
+                    else
+                      echo '{"data-root":"/var/lib/flyte-data/docker"}' > /etc/docker/daemon.json.new
+                    fi
+                    mv /etc/docker/daemon.json.new /etc/docker/daemon.json
+                  fi
+                  systemctl start docker >/dev/null 2>&1 || systemctl restart docker || true
+                  for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+                  echo "docker data-root is now $(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo unknown)"
+                fi
+
                 # GPU: if an NVIDIA device is present (PCI vendor 0x10de), install the
                 # driver + toolkit (baked script), use the gpu image, pass --gpus all.
                 # Pure hardware detection (no instance-type list); dormant on CPU.
@@ -201,7 +269,7 @@ Resources:
                 # Storage backends. Eval/Private mode: chart defaults — rustfs for
                 # object storage, embedded postgres for the runs DB, in-cluster
                 # docker-registry for images, all on the EBS data volume
-                # (/var/lib/docker), snapshotted nightly by AWS Backup.
+                # (/var/lib/flyte-data/docker), snapshotted nightly by AWS Backup.
                 # Prod mode (Domain set): the render script below writes a config
                 # override that points Flyte at the external S3 bucket + Aurora
                 # Serverless v2 cluster + ECR this stack provisions (auto-wired at
@@ -858,6 +926,7 @@ Resources:
           to ec2-tg so the next request hits the box directly. A 'starting' page polls."""
           import base64, json, logging, os
           import boto3
+          from botocore.exceptions import ClientError
 
           log = logging.getLogger(); log.setLevel(logging.INFO)
 
@@ -948,7 +1017,21 @@ Resources:
               state = ec2.describe_instances(InstanceIds=[INSTANCE_ID])["Reservations"][0]["Instances"][0]["State"]["Name"]
               log.info("wake invoked state=%s", state)
               if state == "stopped":
-                  ec2.start_instances(InstanceIds=[INSTANCE_ID])
+                  # On Spot, StartInstances fails when there is no capacity for the
+                  # instance type. Say so plainly: without this the exception
+                  # escapes and the ALB renders a bare 502, which looks like the
+                  # devbox is broken rather than waiting for capacity.
+                  try:
+                      ec2.start_instances(InstanceIds=[INSTANCE_ID])
+                  except ClientError as e:
+                      code = e.response.get("Error", {}).get("Code", "")
+                      log.warning("start_instances failed: %s", code)
+                      if "Capacity" in code or "InsufficientInstanceCapacity" in code:
+                          return _response(event, 503, "Waiting for Spot capacity",
+                                           "AWS has no Spot capacity for this instance type right now. "
+                                           "The devbox starts automatically when capacity returns - reload in a few minutes. "
+                                           "To stop depending on Spot, update the stack with UseSpot=No.")
+                      raise
                   return _response(event, 200, "Starting your Flyte devbox", "EC2 boot + Docker + k3s startup takes about 2 minutes.")
               if state in ("pending", "stopping"):
                   return _response(event, 200, "Devbox is " + state, "Reload in a moment.")
@@ -1051,6 +1134,93 @@ Resources:
         DNSName: !GetAtt LoadBalancer.DNSName
         HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
         EvaluateTargetHealth: false
+
+  # -------------------------------------------------------------------------
+  # Cancel the persistent Spot request on stack delete.
+  #
+  # A persistent request re-opens when its instance is terminated and launches a
+  # replacement, so deleting the stack would otherwise leave the buyer with an
+  # EC2 running indefinitely and no stack to delete it from. The !Ref Instance
+  # below is load-bearing beyond passing the id: it makes this resource depend
+  # on the Instance, and CloudFormation deletes in reverse dependency order, so
+  # the request is cancelled BEFORE the instance is terminated and nothing gets
+  # relaunched. (No explicit DependsOn - the Ref already enforces it.)
+  # -------------------------------------------------------------------------
+  SpotRequestCleanupRole:
+    Type: AWS::IAM::Role
+    Condition: IsSpot
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: cancel-spot-request
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeSpotInstanceRequests
+                  - ec2:CancelSpotInstanceRequests
+                Resource: "*"
+
+  SpotRequestCleanupFn:
+    Type: AWS::Lambda::Function
+    Condition: IsSpot
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt SpotRequestCleanupRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse, boto3
+          def handler(event, context):
+            try:
+              if event['RequestType'] != 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}); return
+              iid = event['ResourceProperties']['InstanceId']
+              ec2 = boto3.client('ec2')
+              rid = None
+              try:
+                r = ec2.describe_instances(InstanceIds=[iid])['Reservations']
+                if r and r[0]['Instances']:
+                  rid = r[0]['Instances'][0].get('SpotInstanceRequestId')
+              except Exception as e:
+                # The instance may already be gone; fall back to finding the
+                # request by the tag CloudFormation put on the instance.
+                print('describe_instances failed: %s' % e)
+              if not rid:
+                for s in ec2.describe_spot_instance_requests(Filters=[
+                    {'Name': 'instance-id', 'Values': [iid]}])['SpotInstanceRequests']:
+                  rid = s['SpotInstanceRequestId']; break
+              if rid:
+                ec2.cancel_spot_instance_requests(SpotInstanceRequestIds=[rid])
+                print('cancelled %s' % rid)
+              else:
+                print('no spot request found for %s; nothing to cancel' % iid)
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              # Never block stack deletion on this. A leaked request is a visible
+              # running instance the operator can kill; a stack stuck in
+              # DELETE_FAILED is worse and harder to get out of.
+              print('cleanup failed: %s' % e)
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                               reason='cleanup failed: ' + str(e)[:200])
+
+  SpotRequestCleanup:
+    Type: Custom::SpotRequestCleanup
+    Condition: IsSpot
+    Properties:
+      ServiceToken: !GetAtt SpotRequestCleanupFn.Arn
+      InstanceId: !Ref Instance
+
 
 Outputs:
   InstanceId:

@@ -34,6 +34,24 @@ A persistent, shareable single-node deployment. Adds:
 
 *Use it for:* a long-lived devbox a team can sign into over HTTPS.
 
+### Spot (`UseSpot=Yes`, either mode)
+Runs the EC2 as a **persistent Spot request with `InstanceInterruptionBehavior:
+stop`**, never the one-time/terminate default. That distinction is the whole
+design: terminate would delete the root volume and drop the instance id, taking
+the EIP association and the ALB target registration with it. With `stop`, an
+interruption is the same event the idle agent already causes routinely - the data
+volume, instance id, address and ALB registration all survive, and the box comes
+back when capacity does.
+
+What doesn't survive is work in flight: a running task is SIGKILLed and restarted
+from scratch (Flyte counts vanished pods as SYSTEM failures, which retry against
+a finite budget). Good for interactive and repeatable batch work, and the saving
+is largest on GPU types; bad for a long unattended run on a deadline.
+
+The persistent Spot request is cancelled on stack delete by a custom resource -
+without it the request would re-open on termination and launch a replacement you
+have no stack to delete.
+
 ### Beyond a single node
 This stack is intentionally **single-EC2** — simple, cheap, auto-stopping. For
 multi-node / HA / heavy concurrent use, that's the boundary: move to **EKS + the
