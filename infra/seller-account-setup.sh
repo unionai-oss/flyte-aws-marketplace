@@ -39,6 +39,13 @@ EOF
 # Scoped to what the two workflows actually do. Notably NOT enough to run the
 # devbox smoke test, which deploys a full stack (CloudFormation, RDS, ELB,
 # Cognito, IAM) — that needs a separate, broader role. See the note below.
+#
+# ValidateListingTemplates is for package-marketplace.sh, which validates the
+# root and nested templates before uploading them so a broken template is caught
+# here rather than by a Marketplace reviewer. cloudformation:ValidateTemplate
+# takes no resource-level conditions, hence Resource "*". (ec2:DescribeImages,
+# which submit-version.sh uses to check AMI ownership, already comes from the
+# AmazonEC2FullAccess attached below for packer.)
 cat > "${WORK}/perms.json" <<EOF
 {
   "Version": "2012-10-17",
@@ -64,6 +71,12 @@ cat > "${WORK}/perms.json" <<EOF
       "Action": ["aws-marketplace:StartChangeSet", "aws-marketplace:DescribeChangeSet",
                  "aws-marketplace:ListChangeSets", "aws-marketplace:DescribeEntity",
                  "aws-marketplace:ListEntities"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ValidateListingTemplates",
+      "Effect": "Allow",
+      "Action": "cloudformation:ValidateTemplate",
       "Resource": "*"
     },
     {
