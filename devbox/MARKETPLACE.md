@@ -145,8 +145,18 @@ cost a rejected submission:
   above). Check with an unauthenticated `curl` after uploading.
 - The AMI comes from a template parameter (`AmiId`), never a hardcoded id or a
   community AMI.
-- Parameters are grouped for the console with `AWS::CloudFormation::Interface`,
-  which the variant adds.
+- Parameters are grouped for the console with `AWS::CloudFormation::Interface`.
+  That block lives in `root.yaml` (our own console deploys want the same
+  ordering); the variant only *patches* it — the "AMI source" group becomes
+  the "AWS Marketplace" group, `AmiSsmParameter` drops out of it, and the three
+  `MPS3*` parameters drop in. The group stays **last** so a buyer reads the
+  deployment route, network access and sizing before reaching a group whose
+  label tells them not to touch it. The `MPS3*` fields cannot be hidden —
+  CloudFormation has no hidden-parameter mechanism and `NoEcho` only masks the
+  value — so their descriptions say plainly that AWS owns them.
+- If a buyer sees `flyte-marketplace-assets-*` as the `MPS3BucketName` default,
+  they launched our seller-bucket URL directly rather than the ingested
+  Marketplace version; AWS rewrites that default to its own bucket on ingestion.
 
 ## 5. Listing (Marketplace Management Portal)
 
