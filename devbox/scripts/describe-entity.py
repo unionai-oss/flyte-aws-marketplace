@@ -74,6 +74,21 @@ def _options(node, version, out):
     return out
 
 
+def outline(node, depth=0, max_depth=4):
+    """A compact shape of the response - keys and container types, no values.
+
+    Printed so that a DetailsDocument we cannot parse is diagnosable from the CI
+    log without dumping the whole (large) document.
+    """
+    if depth >= max_depth:
+        return "..."
+    if isinstance(node, dict):
+        return {k: outline(v, depth + 1, max_depth) for k, v in list(node.items())[:25]}
+    if isinstance(node, list):
+        return [outline(node[0], depth + 1, max_depth), f"...x{len(node)}"] if node else []
+    return type(node).__name__
+
+
 def main():
     entity = json.loads(sys.argv[1])
     ami_id = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -92,6 +107,8 @@ def main():
 
     result = {
         "entity_identifier": entity.get("EntityIdentifier") or entity.get("EntityArn"),
+        "entity_keys": sorted(entity.keys()),
+        "details_outline": outline(doc),
         "ami_id": ami_id,
         "options": options,
         "target_option_id": None,
@@ -125,14 +142,12 @@ def main():
                                     "rejected, but it is not on a CloudFormation delivery "
                                     "option that could be updated instead")
     elif not published:
-        if not options:
-            # Nothing published at all, so there is nothing that could collide.
-            result["resolution"] = "add"
-        else:
-            # Never fall back to "add": if the AMI IS already on a version and we
-            # simply could not see it, add is rejected as a duplicate.
-            result["resolution"] = ("DescribeEntity returned no AMI ids, so whether this AMI "
-                                    "is already published cannot be determined")
+        # "Found no AMI ids" is NOT "the listing is empty" - the two are
+        # indistinguishable from here, and guessing "add" on the second reading
+        # is how this resolved to a guaranteed Duplicate AMI id rejection. Only
+        # a positive list of published AMIs can justify "add", so refuse.
+        result["resolution"] = ("DescribeEntity returned no AMI ids, so whether this AMI is "
+                                "already published cannot be determined - see details_outline")
     else:
         result["resolution"] = "add"
 
