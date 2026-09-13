@@ -34,7 +34,8 @@
 #   AWS_PROFILE=union-seller scripts/package-marketplace.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUCKET="${MARKETPLACE_ASSET_BUCKET:-flyte-marketplace-assets-747712783559}"
+source "${REPO_ROOT}/versions.env"
+BUCKET="${MARKETPLACE_ASSET_BUCKET}"
 REGION="${AWS_REGION:-us-east-1}"
 # Must end in "/" — it is concatenated directly onto the object key in the !Sub.
 KEY_PREFIX="devbox/templates/"
@@ -78,6 +79,36 @@ t = t.replace(
     'The Flyte devbox AMI. AWS Marketplace populates this automatically with the\n'
     '      AMI for your Region; there is no need to change it.')
 
+# root.yaml already carries an AWS::CloudFormation::Interface that orders the
+# console by deployment route. Patch that one rather than emitting a second
+# Metadata key (which would be a duplicate mapping key and invalid YAML): the
+# "AMI source" group becomes the Marketplace group, AmiSsmParameter leaves it
+# along with the parameter itself, and the MPS3 three join it. Keeping it LAST
+# is the point — the buyer reads route, access and sizing before reaching a
+# group whose label tells them to stop reading.
+before = t
+t = t.replace(
+    '          default: "AMI source - set automatically, do not edit"\n'
+    '        Parameters:\n'
+    '          - AmiId\n'
+    '          - AmiSsmParameter\n',
+    '          default: "AWS Marketplace - set automatically, do not edit"\n'
+    '        Parameters:\n'
+    '          - AmiId\n'
+    '          - MPS3BucketName\n'
+    '          - MPS3BucketRegion\n'
+    '          - MPS3KeyPrefix\n')
+if t == before:
+    sys.exit("AMI source ParameterGroup not found — did root.yaml's Interface change?")
+
+before = t
+t = t.replace('      AmiSsmParameter: {default: "AMI SSM parameter"}\n',
+              '      MPS3BucketName: {default: "Template bucket (AWS-managed)"}\n'
+              '      MPS3BucketRegion: {default: "Template bucket region (AWS-managed)"}\n'
+              '      MPS3KeyPrefix: {default: "Template key prefix (AWS-managed)"}\n')
+if t == before:
+    sys.exit("AmiSsmParameter ParameterLabel not found — did root.yaml's Interface change?")
+
 if 'AmiSsmParameter' in t:
     sys.exit("AmiSsmParameter still referenced after rewrite:\n" +
              "\n".join(l for l in t.splitlines() if 'AmiSsmParameter' in l))
@@ -97,6 +128,11 @@ if 'HasAmiId' in t:
 # defaults to point at its own copy of the templates once the version is
 # submitted. Until then the defaults have to resolve to the seller bucket, which
 # must be publicly readable.
+# The descriptions are what a BUYER reads in the console. They cannot be hidden
+# — CloudFormation has no hidden-parameter mechanism, and NoEcho only masks the
+# value — so the next best thing is to say plainly that AWS owns these fields.
+DO_NOT_EDIT = ('Set automatically by AWS Marketplace. Do not edit; '
+               'changing it will break the launch.')
 mp_params = (
     '  # --- AWS Marketplace nested-template location ---\n'
     '  # AWS rewrites these three defaults when it copies the nested templates\n'
@@ -104,15 +140,15 @@ mp_params = (
     '  MPS3BucketName:\n'
     '    Type: String\n'
     f'    Default: {bucket}\n'
-    '    Description: S3 bucket holding the nested templates.\n'
+    f'    Description: {DO_NOT_EDIT}\n'
     '  MPS3BucketRegion:\n'
     '    Type: String\n'
     f'    Default: {region}\n'
-    '    Description: Region of the S3 bucket holding the nested templates.\n'
+    f'    Description: {DO_NOT_EDIT}\n'
     '  MPS3KeyPrefix:\n'
     '    Type: String\n'
     f'    Default: {prefix}\n'
-    '    Description: S3 key prefix (a trailing "/" is required) for the nested templates.\n'
+    f'    Description: {DO_NOT_EDIT}\n'
 )
 
 if not t.startswith('AWSTemplateFormatVersion'):
@@ -120,22 +156,6 @@ if not t.startswith('AWSTemplateFormatVersion'):
 if '\nParameters:\n' not in t:
     sys.exit("no Parameters block found")
 t = t.replace('\nParameters:\n', '\nParameters:\n' + mp_params, 1)
-
-# Group them in the console the way the AWS example does.
-interface = (
-    'Metadata:\n'
-    '  AWS::CloudFormation::Interface:\n'
-    '    ParameterGroups:\n'
-    '      - Label:\n'
-    '          default: AWS Marketplace Parameters\n'
-    '        Parameters:\n'
-    '          - AmiId\n'
-    '          - MPS3BucketName\n'
-    '          - MPS3BucketRegion\n'
-    '          - MPS3KeyPrefix\n'
-    '\n'
-)
-t = t.replace('\nParameters:\n', '\n' + interface + 'Parameters:\n', 1)
 
 def to_mp_url(m):
     name = os.path.basename(m.group(2))
@@ -183,6 +203,16 @@ else
 fi
 
 BASE="https://${BUCKET}.s3.${REGION}.amazonaws.com"
+MANIFEST="${REPO_ROOT}/.package-manifest.json"
+cat > "${MANIFEST}" <<EOF
+{
+  "template_url": "${BASE}/devbox/flyte-devbox-${VERSION}.yaml",
+  "diagram_url": "${BASE}/devbox/architecture.png",
+  "version": "${VERSION}"
+}
+EOF
+echo "   wrote ${MANIFEST} (read by scripts/submit-version.sh)"
+
 cat <<EOF
 
 >> Listing URLs:
@@ -190,8 +220,10 @@ cat <<EOF
    (stable alias)          : ${BASE}/devbox/flyte-devbox-latest.yaml
    Architecture diagram    : ${BASE}/devbox/architecture.png
 
-   Submit the VERSIONED template url, not the alias — a listing should not
-   change underneath a version that AWS already reviewed.
+   Submit with:  scripts/submit-version.sh
+   It reads .package-manifest.json, so it submits the VERSIONED url above
+   rather than the alias — a listing should not change underneath a version
+   AWS has already reviewed.
 
    These objects must be readable by AWS Marketplace, and the nested templates
    under ${KEY_PREFIX} must be publicly readable at review time. See MARKETPLACE.md.

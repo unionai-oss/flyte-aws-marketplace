@@ -1,0 +1,29 @@
+Flyte is an open-source orchestrator for data and ML pipelines. This listing runs
+Flyte 2 as a devbox on one EC2 instance - k3s, the Flyte control plane, the
+console and a container registry, all on a single auto-stopping host - so a team
+can get a working Flyte endpoint without standing up and operating a Kubernetes
+cluster.
+
+The template offers two deployment routes, selected by the Domain parameter.
+
+Secure route (Domain set). An Application Load Balancer terminates HTTPS with an
+automatically validated ACM certificate and a Route 53 record in a hosted zone
+you already own. Amazon Cognito guards the console, the API and the CLI: browser
+SSO for people, native PKCE for the Flyte CLI, and client-credentials for CI, so
+no static secrets live in client config. Durable state moves off the instance to
+Amazon S3, Aurora Serverless v2 (PostgreSQL, scale-to-zero) and Amazon ECR, and
+survives instance replacement. A stopped instance wakes on an authenticated
+request. This is the route for a long-lived devbox a team signs into.
+
+Evaluation route (Domain blank). Plain HTTP on an Elastic IP with in-cluster
+storage on a snapshotted EBS volume, restricted to the CIDR you supply. There is
+no authentication on this route, so the CIDR is the only control - use a single
+address or your office egress range. Intended for throwaway evaluations and
+demos, not for real data.
+
+Both routes auto-stop the instance after a configurable idle period with no
+running executions, so a devbox that is not being used costs only storage.
+
+This stack is deliberately a single instance: simple, cheap, and auto-stopping.
+For multi-node, highly available, or heavily concurrent workloads, run Flyte on
+Amazon EKS instead.

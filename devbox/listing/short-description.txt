@@ -1,0 +1,1 @@
+A single-EC2 Flyte 2 devbox: k3s, the Flyte control plane, and an object store on one auto-stopping instance. Choose an authenticated HTTPS deployment with Cognito sign-in, S3 and Aurora Serverless v2, or a CIDR-locked evaluation deployment that costs nothing while idle.

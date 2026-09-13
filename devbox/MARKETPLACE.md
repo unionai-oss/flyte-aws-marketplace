@@ -145,8 +145,53 @@ cost a rejected submission:
   above). Check with an unauthenticated `curl` after uploading.
 - The AMI comes from a template parameter (`AmiId`), never a hardcoded id or a
   community AMI.
-- Parameters are grouped for the console with `AWS::CloudFormation::Interface`,
-  which the variant adds.
+- Parameters are grouped for the console with `AWS::CloudFormation::Interface`.
+  That block lives in `root.yaml` (our own console deploys want the same
+  ordering); the variant only *patches* it — the "AMI source" group becomes
+  the "AWS Marketplace" group, `AmiSsmParameter` drops out of it, and the three
+  `MPS3*` parameters drop in. The group stays **last** so a buyer reads the
+  deployment route, network access and sizing before reaching a group whose
+  label tells them not to touch it. The `MPS3*` fields cannot be hidden —
+  CloudFormation has no hidden-parameter mechanism and `NoEcho` only masks the
+  value — so their descriptions say plainly that AWS owns them.
+- If a buyer sees `flyte-marketplace-assets-*` as the `MPS3BucketName` default,
+  they launched our seller-bucket URL directly rather than the ingested
+  Marketplace version; AWS rewrites that default to its own bucket on ingestion.
+
+## 3b. Submitting the version
+
+`scripts/submit-version.sh` builds the `AddDeliveryOptions` change set and sends
+it through the Catalog API, so a release is reviewed in a PR instead of retyped
+into the portal at 11pm:
+
+```bash
+scripts/package-marketplace.sh        # uploads template + diagram, writes the manifest
+VALIDATE_ONLY=1 scripts/submit-version.sh   # AWS's own checks, creates nothing
+scripts/submit-version.sh                   # validate, then submit for real
+```
+
+Or from CI: run the **devbox AMI** workflow with `submit: true` (and
+`validate_only: true` for a rehearsal). That job sits behind the
+`marketplace-publish` environment, and works even when no new AMI was built —
+the common case is a template- or copy-only version against the AMI already in
+SSM.
+
+The devbox is an `AmiProduct@1.0` with a **CloudFormation delivery option**, so
+the details key is `DeploymentTemplateDeliveryOptionDetails` — not the
+`CloudFormation*` name the field naming would suggest. A version is
+(AMI + template + copy) submitted together; delivery options cannot be added to
+an existing version afterwards.
+
+Set `MARKETPLACE_PRODUCT_ID` in `versions.env` (and the repo variable
+`DEVBOX_MARKETPLACE_PRODUCT_ID` for CI) to the `prod-...` id from the portal URL.
+
+**Always run `VALIDATE_ONLY=1` first.** It submits under `Intent=VALIDATE`, which
+runs the same server-side checks without creating a version. Version titles must
+be unique across the product's history and a *rejected* submission still consumes
+one, so a rehearsal costs a minute and saves a burned title. The script also
+refuses to submit the `flyte-devbox-latest.yaml` alias, checks for an in-flight
+change set, and verifies the AMI is owned by this account in us-east-1 (the only
+region the Catalog API ingests from).
 
 ## 5. Listing (Marketplace Management Portal)
 
