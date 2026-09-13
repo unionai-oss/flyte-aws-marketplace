@@ -260,7 +260,15 @@ the delivery-option level for Add, inside
 `DeploymentTemplateDeliveryOptionDetails` for Update. The script handles that;
 mention it only because hand-editing a payload gets it wrong.
 
-**Always run `VALIDATE_ONLY=1` first.** It submits under `Intent=VALIDATE`, which
+**`VALIDATE_ONLY` only works in add mode.** AWS accepts `Intent` per change
+type, and rejects it outright for `UpdateDeliveryOptions` on `AmiProduct@1.0`
+(*"Intent not supported for change type"*), so update has no server-side
+rehearsal. Use `DRY_RUN=1` there to inspect the change set without sending it.
+That asymmetry is survivable because the risk is asymmetric too: update consumes
+no version title, so a rejection can be corrected and resubmitted against the
+same version, while a rejected *add* spends its title permanently.
+
+**In add mode, always run `VALIDATE_ONLY=1` first.** It submits under `Intent=VALIDATE`, which
 runs the same server-side checks without creating a version. Version titles must
 be unique across the product's history and a *rejected* submission still consumes
 one, so a rehearsal costs a minute and saves a burned title. The script also
