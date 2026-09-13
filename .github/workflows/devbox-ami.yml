@@ -19,6 +19,14 @@ on:
         description: "Skip the smoke test. Publishes an UNVALIDATED AMI to SSM."
         type: boolean
         default: false
+      submit:
+        description: "Also submit the AMI to AWS Marketplace as a new version (irreversible; a rejection burns the version title)"
+        type: boolean
+        default: false
+      validate_only:
+        description: "With submit: run AWS's validation (Intent=VALIDATE) without creating a version"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -139,4 +147,41 @@ jobs:
             --value "${{ needs.check.outputs.digest }}" --overwrite
           echo "published $AMI"
           echo "### devbox AMI \`$AMI\` published" >> "$GITHUB_STEP_SUMMARY"
-          echo "Submit it as a new version with IAM access role \`arn:aws:iam::747712783559:role/AWSMarketplaceAmiIngestion\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "Submit it with the \`submit: true\` input, or locally with \`devbox/scripts/package-marketplace.sh && devbox/scripts/submit-version.sh\`." >> "$GITHUB_STEP_SUMMARY"
+
+  # Packaging and submission are split from the AMI build on purpose. Publishing
+  # an AMI to SSM is reversible — the next build overwrites it. Submitting a
+  # Marketplace version is not: a rejected submission permanently consumes the
+  # version title, and Marketplace refuses a new version while one is still
+  # processing. So this runs only when asked for, behind a reviewed environment.
+  submit:
+    name: submit version to AWS Marketplace
+    needs: [check, build, publish]
+    # always() because the common case is a template- or listing-copy-only
+    # version: no new devbox image, so check says build=false and build/publish
+    # both skip. A skipped dependency is not a failed one, and submit-version.sh
+    # falls back to the AMI id in SSM when the build job produced none — so this
+    # still submits the current, smoke-tested AMI against the new template.
+    if: always() && inputs.submit && needs.build.result != 'failure' && needs.publish.result != 'failure'
+    runs-on: ubuntu-latest
+    environment: marketplace-publish     # required reviewers live here
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Uploads the buyer-facing template variant and the architecture diagram,
+      # and writes devbox/.package-manifest.json with the VERSIONED urls.
+      - name: package listing assets
+        run: devbox/scripts/package-marketplace.sh
+
+      - name: submit
+        env:
+          MARKETPLACE_PRODUCT_ID: ${{ vars.DEVBOX_MARKETPLACE_PRODUCT_ID }}
+          # Empty when build was skipped; submit-version.sh then reads the
+          # validated AMI id from SSM.
+          AMI_ID: ${{ needs.build.outputs.ami }}
+          VALIDATE_ONLY: ${{ inputs.validate_only && '1' || '0' }}
+        run: devbox/scripts/submit-version.sh

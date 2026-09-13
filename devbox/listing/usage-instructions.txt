@@ -1,0 +1,71 @@
+1. LAUNCH
+
+In the CloudFormation form, the first parameter group is "Deployment route".
+It decides everything else:
+
+  Secure route  - enter a hostname you own in Domain (e.g. flyte.acme.com). A
+                  Route 53 public hosted zone for that name must already exist
+                  in this account; the stack discovers it, so there is no zone
+                  ID to supply. You get HTTPS, a Route 53 record and Cognito
+                  sign-in in front of the console, the API and the CLI.
+
+  Evaluation    - leave Domain blank. Plain HTTP on an Elastic IP with NO
+                  authentication. AllowedCidr is the only thing protecting it,
+                  so set it to your own address (1.2.3.4/32) or your office
+                  egress range. Do not use 0.0.0.0/0 on this route.
+
+Set AllowedCidr on either route. On the secure route it gates the load balancer
+and 0.0.0.0/0 is reasonable, because Cognito is what actually guards access.
+
+Leave the "AWS Marketplace" parameter group alone - AWS fills those in.
+
+2. FIRST SIGN-IN (secure route)
+
+Stack Outputs -> FlyteUrl opens the console. Cognito has no users yet, so create
+one:
+
+  aws cognito-idp admin-create-user \
+    --user-pool-id <CognitoUserPoolId from Outputs> \
+    --username you@example.com --user-attributes Name=email,Value=you@example.com
+
+Sign in and set a permanent password when prompted.
+
+3. CONNECT THE CLI
+
+Secure route - authenticates through Cognito with PKCE; a browser window opens
+on first use:
+
+  flyte config init --endpoint dns:///<your domain>:443
+
+Evaluation route - no auth, so the client must be told the endpoint is plain
+HTTP. Use the EndpointUrl and the insecure flag from the stack Outputs:
+
+  flyte config init --endpoint dns:///<eip>:80 --insecure
+
+Then run a workflow:
+
+  flyte run hello.py main
+
+4. COSTS AND AUTO-STOP
+
+The instance stops itself after IdleThresholdMinutes with no running executions
+(default 30). On the secure route the load balancer serves a wake page and
+forwards once the instance is healthy, so you just reload the URL. On the
+evaluation route, start it yourself:
+
+  aws ec2 start-instances --instance-ids <InstanceId from Outputs>
+
+Set AutoStop to No for an always-on deployment. Aurora Serverless v2 scales to
+zero on the secure route, so an idle stack costs storage plus the load balancer
+and, if you allocated one, the Elastic IP.
+
+5. TEARDOWN
+
+Delete the stack. The S3 bucket, the Aurora cluster, the ECR repository and the
+backup vault are retained on purpose - they hold real data and images. Delete
+them separately once you are sure you no longer need them.
+
+6. SUPPORT
+
+Documentation: https://www.union.ai/docs/v2/
+Flyte community: https://slack.flyte.org

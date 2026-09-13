@@ -34,7 +34,8 @@
 #   AWS_PROFILE=union-seller scripts/package-marketplace.sh
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUCKET="${MARKETPLACE_ASSET_BUCKET:-flyte-marketplace-assets-747712783559}"
+source "${REPO_ROOT}/versions.env"
+BUCKET="${MARKETPLACE_ASSET_BUCKET}"
 REGION="${AWS_REGION:-us-east-1}"
 # Must end in "/" — it is concatenated directly onto the object key in the !Sub.
 KEY_PREFIX="devbox/templates/"
@@ -202,6 +203,16 @@ else
 fi
 
 BASE="https://${BUCKET}.s3.${REGION}.amazonaws.com"
+MANIFEST="${REPO_ROOT}/.package-manifest.json"
+cat > "${MANIFEST}" <<EOF
+{
+  "template_url": "${BASE}/devbox/flyte-devbox-${VERSION}.yaml",
+  "diagram_url": "${BASE}/devbox/architecture.png",
+  "version": "${VERSION}"
+}
+EOF
+echo "   wrote ${MANIFEST} (read by scripts/submit-version.sh)"
+
 cat <<EOF
 
 >> Listing URLs:
@@ -209,8 +220,10 @@ cat <<EOF
    (stable alias)          : ${BASE}/devbox/flyte-devbox-latest.yaml
    Architecture diagram    : ${BASE}/devbox/architecture.png
 
-   Submit the VERSIONED template url, not the alias — a listing should not
-   change underneath a version that AWS already reviewed.
+   Submit with:  scripts/submit-version.sh
+   It reads .package-manifest.json, so it submits the VERSIONED url above
+   rather than the alias — a listing should not change underneath a version
+   AWS has already reviewed.
 
    These objects must be readable by AWS Marketplace, and the nested templates
    under ${KEY_PREFIX} must be publicly readable at review time. See MARKETPLACE.md.

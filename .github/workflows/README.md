@@ -6,7 +6,7 @@ Validation stays on Buildkite (`.buildkite/`) — these workflows are the
 
 | workflow | trigger | what it does |
 |---|---|---|
-| `devbox-ami.yml` | daily + manual | Rebuilds the devbox AMI when a new `flyte-devbox` image ships, smoke-tests it, and writes the id to SSM. |
+| `devbox-ami.yml` | daily + manual | Rebuilds the devbox AMI when a new `flyte-devbox` image ships, smoke-tests it, and writes the id to SSM. With `submit: true`, also packages the listing template and submits a Marketplace version. |
 | `eks-addon.yml` | daily + manual | Bumps to a new upstream `flyte-binary` chart, validates, pushes the chart and images to the Marketplace ECR, and opens a PR. Submitting the version is a separate, manual job. |
 
 ## Setup
@@ -19,6 +19,11 @@ Both authenticate with OIDC — no long-lived AWS keys.
 2. Repo variables:
    - `AWS_PUBLISH_ROLE_ARN` — `github-actions-flyte-marketplace`.
    - `AWS_SMOKE_ROLE_ARN` — `github-actions-flyte-devbox-smoke`.
+   - `DEVBOX_MARKETPLACE_PRODUCT_ID` — the devbox listing's `prod-...` id, used
+     by `devbox-ami.yml`'s `submit` job. The EKS equivalent lives in
+     `eks/versions.env` because that product id is not a secret either; this one
+     is a repo variable only so the workflow does not need a repo edit to move
+     between a limited and a public listing.
 3. Environments:
    - `marketplace-publish` — put required reviewers on it. Submitting a version
      is irreversible and a rejection burns a chart tag.
@@ -58,6 +63,14 @@ bad idea:
 Run it with `submit: true` once the previous version is live. If you'd rather it
 fire automatically, drop the `if: inputs.submit` on the `submit` job — the
 `marketplace-publish` environment still gates it.
+
+`devbox-ami.yml` splits the same way and for a similar reason: publishing an AMI
+id to SSM is reversible (the next build overwrites it), but a Marketplace version
+is not — a rejection permanently consumes the version title. Its `submit` job
+also runs when no AMI was built, because a template- or listing-copy-only version
+against the AMI already in SSM is the common case. Both products support
+`validate_only`, which submits under `Intent=VALIDATE` and creates nothing; use
+it as a rehearsal before spending a version title.
 
 ## Why two roles
 

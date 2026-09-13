@@ -1,0 +1,7 @@
+Rebuild of the Flyte devbox AMI on the current flyte-devbox release.
+
+The CloudFormation launch form has been reorganised so the parameters are
+grouped and ordered by what you actually need to decide: the deployment route
+first, then network access, then sizing. The Domain and AllowedCidr fields now
+state plainly which route each one belongs to, and that the evaluation route
+(Domain left blank) has no authentication and is protected only by AllowedCidr.

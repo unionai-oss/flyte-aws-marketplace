@@ -35,3 +35,6 @@ kubeconfig*
 .idea/
 .vscode/
 .marketplace-root.yaml
+
+# Marketplace packaging handoff (scripts/package-marketplace.sh -> submit-version.sh)
+devbox/.package-manifest.json
