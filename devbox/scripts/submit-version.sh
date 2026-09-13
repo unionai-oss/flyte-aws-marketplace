@@ -14,10 +14,22 @@
 # template URL, so the version you submit is the artifact you just uploaded
 # rather than whatever "latest" happens to point at.
 #
+# TWO MODES, because AWS requires every VERSION of an AMI product to carry a
+# DISTINCT AMI id. Submitting a new version against an AMI already used by an
+# existing version is rejected with "Duplicate AMI id", so a template- or
+# copy-only change cannot be a new version at all:
+#
+#   MODE=add     (default) a genuinely new version: new AMI + template + copy,
+#                sent as AddDeliveryOptions. Needs an AMI id no version has used.
+#   MODE=update  change the template, diagram or listing copy of an EXISTING
+#                version in place, sent as UpdateDeliveryOptions. Touches no AMI
+#                and consumes no version title.
+#
 # Usage:
-#   scripts/submit-version.sh                 # validate server-side, then submit
-#   DRY_RUN=1 scripts/submit-version.sh       # print the change set, send nothing
-#   VALIDATE_ONLY=1 scripts/submit-version.sh # run AWS's validation, create nothing
+#   scripts/submit-version.sh                    # new version (needs a new AMI)
+#   MODE=update scripts/submit-version.sh        # retarget an existing version
+#   DRY_RUN=1 scripts/submit-version.sh          # print the change set, send nothing
+#   VALIDATE_ONLY=1 scripts/submit-version.sh    # run AWS's validation, create nothing
 #
 # VALIDATE_ONLY is worth the extra minute. It runs the same server-side checks as
 # a real submission under Intent=VALIDATE without consuming a version title or
@@ -28,6 +40,8 @@ source "${REPO_ROOT}/versions.env"
 LISTING="${REPO_ROOT}/listing"
 MANIFEST="${REPO_ROOT}/.package-manifest.json"
 AWS_REGION="${AWS_REGION:-us-east-1}"
+MODE="${MODE:-add}"
+case "${MODE}" in add|update) ;; *) echo "MODE must be 'add' or 'update', got '${MODE}'" >&2; exit 1;; esac
 
 : "${MARKETPLACE_PRODUCT_ID:?set MARKETPLACE_PRODUCT_ID in devbox/versions.env (the prod-... id from the portal URL)}"
 
@@ -55,7 +69,11 @@ case "${TEMPLATE_URL}" in
     exit 1;;
 esac
 
-# --- the AMI -----------------------------------------------------------------
+# --- the AMI (add mode only) -------------------------------------------------
+# Deliberately not read in update mode: the AMI of an existing version is exactly
+# what must NOT change, and sending TemplateSources with the AMI already on that
+# version is what produces "Duplicate AMI id".
+if [[ "${MODE}" == "add" ]]; then
 # Read it from SSM rather than taking it as an argument: the AMI pipeline writes
 # that parameter only after the smoke test passes, so a submission cannot name an
 # image that was never validated.
@@ -71,6 +89,71 @@ aws ec2 describe-images --image-ids "${AMI_ID}" --region us-east-1 \
   echo "FAIL: ${AMI_ID} is not an AMI owned by this account in us-east-1." >&2
   echo "      Marketplace ingests only from us-east-1 in the seller account." >&2
   exit 1; }
+fi
+
+# --- the target version (update mode only) -----------------------------------
+# UpdateDeliveryOptions addresses one delivery option on one version, so it needs
+# the entity identifier with its @version suffix and the delivery option's id.
+# Both come from DescribeEntity. The response is walked tolerantly rather than
+# by a fixed path, and printed, so an unexpected shape is visible instead of
+# silently producing a change set aimed at the wrong thing. Override either with
+# ENTITY_IDENTIFIER= / DELIVERY_OPTION_ID= if the discovery picks wrong.
+if [[ "${MODE}" == "update" ]]; then
+  echo ">> describing ${MARKETPLACE_PRODUCT_ID} to find the version to update"
+  ENTITY_JSON="$(aws marketplace-catalog describe-entity --catalog AWSMarketplace \
+    --region "${AWS_REGION}" --entity-id "${MARKETPLACE_PRODUCT_ID}" --output json)"
+
+  DISCOVERED="$(python3 - "${ENTITY_JSON}" <<'PYD'
+import json, sys
+e = json.loads(sys.argv[1])
+doc = e.get("DetailsDocument")
+if doc is None and isinstance(e.get("Details"), str):
+    doc = json.loads(e["Details"])          # older shape: Details is a JSON string
+doc = doc or {}
+
+# Collect every delivery option that carries CloudFormation template details,
+# wherever it sits, remembering the version it belongs to.
+found = []
+def walk(node, version):
+    if isinstance(node, dict):
+        v = node.get("VersionTitle") or node.get("Id") if "DeliveryOptions" in node else None
+        for opt in node.get("DeliveryOptions") or []:
+            if isinstance(opt, dict) and "DeploymentTemplateDeliveryOptionDetails" in (opt.get("Details") or {}):
+                found.append({"option_id": opt.get("Id"),
+                              "version": node.get("VersionTitle") or version,
+                              "visibility": opt.get("Visibility")})
+        for k, val in node.items():
+            walk(val, node.get("VersionTitle") or version)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item, version)
+walk(doc, None)
+
+print(json.dumps({
+    "entity_identifier": e.get("EntityIdentifier") or e.get("EntityArn"),
+    "options": found,
+}))
+PYD
+)"
+  echo "${DISCOVERED}" | python3 -m json.tool
+
+  ENTITY_IDENTIFIER="${ENTITY_IDENTIFIER:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["entity_identifier"] or "")' "${DISCOVERED}")}"
+  DELIVERY_OPTION_ID="${DELIVERY_OPTION_ID:-$(python3 -c '
+import json,sys
+o=json.loads(sys.argv[1])["options"]
+print(o[-1]["option_id"] if len(o)==1 else "")' "${DISCOVERED}")}"
+
+  [[ -n "${ENTITY_IDENTIFIER}" ]] || {
+    echo "FAIL: could not read the entity identifier from DescribeEntity." >&2
+    echo "      Pass ENTITY_IDENTIFIER=<prod-id>@<version> explicitly." >&2; exit 1; }
+  [[ -n "${DELIVERY_OPTION_ID}" ]] || {
+    echo "FAIL: could not pick a CloudFormation delivery option automatically." >&2
+    echo "      The listing above shows what DescribeEntity returned; choose one and" >&2
+    echo "      pass DELIVERY_OPTION_ID=<id> (and ENTITY_IDENTIFIER if it is not the" >&2
+    echo "      version you want)." >&2; exit 1; }
+  echo "   entity:          ${ENTITY_IDENTIFIER}"
+  echo "   delivery option: ${DELIVERY_OPTION_ID}"
+fi
 
 # --- in-flight check ---------------------------------------------------------
 # Marketplace refuses a second version while one is still processing, and the
@@ -91,7 +174,14 @@ fi
 # Version titles must be unique across the product's whole history and a REJECTED
 # submission still consumes one, so it carries the AMI id: unique by construction,
 # and it says which image a buyer is actually getting.
+# Unset in update mode, where neither is used. Defaulted so `set -u` does not
+# trip on the references below.
+AMI_ID="${AMI_ID:-}"
 VERSION_TITLE="${VERSION_TITLE:-Flyte devbox ${AMI_ID}}"
+CHANGE_SET_NAME="flyte-devbox-${AMI_ID}"
+if [[ "${MODE}" == "update" ]]; then
+  CHANGE_SET_NAME="flyte-devbox-update-$(date +%Y%m%d%H%M%S)"
+fi
 
 # The generator goes to a temp file rather than a heredoc inside $(...): bash 3.2,
 # which is what /bin/bash still is on macOS, mis-parses that combination.
@@ -100,7 +190,8 @@ trap 'rm -f "${GEN}"' EXIT
 cat > "${GEN}" <<'PY'
 import json, pathlib, re, sys
 (listing, product_id, version_title, template_url, diagram_url, ami_id,
- role_arn, user_name, os_name, os_version, instance_type, ami_param) = sys.argv[1:13]
+ role_arn, user_name, os_name, os_version, instance_type, ami_param,
+ mode, entity_identifier, delivery_option_id) = sys.argv[1:16]
 
 # The Catalog API accepts an over-long or oddly-punctuated string happily and
 # then fails the change set asynchronously, half an hour later, having consumed
@@ -123,6 +214,38 @@ def text(name, limit):
         sys.exit(f"{name} has non-ASCII characters {bad} - replace them")
     return body
 
+# Everything both modes send. Update mode omits TemplateSources entirely: the
+# AMI on an existing version must not change, and sending it back is what AWS
+# rejects as "Duplicate AMI id".
+option_title = text("delivery-option-title.txt", 100)
+template_details = {
+    "ShortDescription": text("short-description.txt", 1000),
+    "LongDescription": text("long-description.txt", 5000),
+    "UsageInstructions": text("usage-instructions.txt", 4000),
+    "RecommendedInstanceType": instance_type,
+    "ArchitectureDiagram": diagram_url,
+    "Template": template_url,
+}
+
+if mode == "update":
+    # UpdateDeliveryOptions carries no VersionTitle - it edits a version that
+    # already has one - so there is no title to collide and none to consume.
+    print(json.dumps([{
+        "ChangeType": "UpdateDeliveryOptions",
+        "Entity": {"Type": "AmiProduct@1.0", "Identifier": entity_identifier},
+        "DetailsDocument": {
+            "Version": {"ReleaseNotes": text("release-notes.txt", 30000)},
+            "DeliveryOptions": [{
+                "Id": delivery_option_id,
+                # Update puts the title INSIDE the details object.
+                "Details": {"DeploymentTemplateDeliveryOptionDetails": dict(
+                    template_details, DeliveryOptionTitle=option_title)},
+            }],
+        },
+        "ChangeName": "UpdateDevboxDeliveryOption",
+    }]))
+    raise SystemExit(0)
+
 if len(version_title) > 255:
     sys.exit(f"version title is {len(version_title)} chars, over the 255 limit")
 
@@ -132,15 +255,10 @@ details = {
         "ReleaseNotes": text("release-notes.txt", 30000),
     },
     "DeliveryOptions": [{
-        "DeliveryOptionTitle": text("delivery-option-title.txt", 100),
+        # Add puts the title at the delivery-option level, not in the details.
+        "DeliveryOptionTitle": option_title,
         "Details": {
-            "DeploymentTemplateDeliveryOptionDetails": {
-                "ShortDescription": text("short-description.txt", 1000),
-                "LongDescription": text("long-description.txt", 5000),
-                "UsageInstructions": text("usage-instructions.txt", 4000),
-                "RecommendedInstanceType": instance_type,
-                "ArchitectureDiagram": diagram_url,
-                "Template": template_url,
+            "DeploymentTemplateDeliveryOptionDetails": dict(template_details, **{
                 # AWS injects this version's AMI id into the named template
                 # parameter. It must be the only source of the image, which is
                 # why package-marketplace.sh strips AmiSsmParameter.
@@ -154,7 +272,7 @@ details = {
                         "OperatingSystemVersion": os_version,
                     },
                 }],
-            }
+            })
         },
     }],
 }
@@ -169,11 +287,16 @@ PY
 CHANGE_SET="$(python3 "${GEN}" "${LISTING}" "${MARKETPLACE_PRODUCT_ID}" "${VERSION_TITLE}" \
                 "${TEMPLATE_URL}" "${DIAGRAM_URL}" "${AMI_ID}" "${AMI_INGESTION_ROLE_ARN}" \
                 "${AMI_USER_NAME}" "${AMI_OS_NAME}" "${AMI_OS_VERSION}" \
-                "${RECOMMENDED_INSTANCE_TYPE}" "${AMI_TEMPLATE_PARAMETER}")"
+                "${RECOMMENDED_INSTANCE_TYPE}" "${AMI_TEMPLATE_PARAMETER}" \
+                "${MODE}" "${ENTITY_IDENTIFIER:-}" "${DELIVERY_OPTION_ID:-}")"
 
-echo ">> change set for ${MARKETPLACE_PRODUCT_ID}"
-echo "   version:  ${VERSION_TITLE}"
-echo "   ami:      ${AMI_ID}"
+echo ">> ${MODE} change set for ${MARKETPLACE_PRODUCT_ID}"
+if [[ "${MODE}" == "add" ]]; then
+  echo "   version:  ${VERSION_TITLE}"
+  echo "   ami:      ${AMI_ID}"
+else
+  echo "   entity:   ${ENTITY_IDENTIFIER}   (AMI unchanged)"
+fi
 echo "   template: ${TEMPLATE_URL}"
 echo "${CHANGE_SET}" | python3 -m json.tool
 
@@ -185,7 +308,7 @@ fi
 submit() {  # $1 = Intent
   aws marketplace-catalog start-change-set --catalog AWSMarketplace \
     --region "${AWS_REGION}" \
-    --change-set-name "flyte-devbox-${AMI_ID}" \
+    --change-set-name "${CHANGE_SET_NAME}" \
     --change-set "${CHANGE_SET}" \
     --intent "$1" \
     --query ChangeSetId --output text
@@ -218,7 +341,9 @@ cat <<EOF
        --change-set-id ${ID} --region ${AWS_REGION} \\
        --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'
 
-   Validation takes minutes to hours. A rejection consumes the version title
-   "${VERSION_TITLE}" permanently — the next attempt needs a new AMI or an
-   explicit VERSION_TITLE. See MARKETPLACE.md.
+   Validation takes minutes to hours.
+   ${MODE} mode: $( [[ "${MODE}" == "add" ]] \
+     && echo "a rejection consumes the version title \"${VERSION_TITLE}\" permanently - the next attempt needs a new AMI or an explicit VERSION_TITLE." \
+     || echo "no version title is consumed; a rejection can be corrected and resubmitted against the same version." )
+   See MARKETPLACE.md.
 EOF

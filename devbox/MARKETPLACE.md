@@ -185,6 +185,36 @@ an existing version afterwards.
 Set `MARKETPLACE_PRODUCT_ID` in `versions.env` (and the repo variable
 `DEVBOX_MARKETPLACE_PRODUCT_ID` for CI) to the `prod-...` id from the portal URL.
 
+### Two modes, because every version needs its own AMI
+
+AWS requires each **version** of an AMI product to carry a **distinct AMI id**.
+Submitting a new version against an AMI an existing version already uses is
+rejected with *"Duplicate AMI id - The AMI Id must be different from AMI Id used
+in other versions of this product"*. So a template- or copy-only change **cannot
+be a new version**:
+
+| change | mode | change type |
+|---|---|---|
+| new AMI (+ template + copy) | `MODE=add` (default) | `AddDeliveryOptions` |
+| template, diagram or copy only | `MODE=update` | `UpdateDeliveryOptions` |
+
+```bash
+MODE=update VALIDATE_ONLY=1 scripts/submit-version.sh
+MODE=update scripts/submit-version.sh
+```
+
+Update mode edits an existing version in place. It sends no `TemplateSources`
+(the AMI is exactly what must not change) and no `VersionTitle`, so it consumes
+no version title and a rejection can simply be corrected and resubmitted. It
+finds the version and delivery option via `DescribeEntity` and prints what it
+found; override with `ENTITY_IDENTIFIER=<prod-id>@<version>` and
+`DELIVERY_OPTION_ID=` if the discovery picks the wrong one.
+
+Note the two change types put `DeliveryOptionTitle` in **different places** - at
+the delivery-option level for Add, inside
+`DeploymentTemplateDeliveryOptionDetails` for Update. The script handles that;
+mention it only because hand-editing a payload gets it wrong.
+
 **Always run `VALIDATE_ONLY=1` first.** It submits under `Intent=VALIDATE`, which
 runs the same server-side checks without creating a version. Version titles must
 be unique across the product's history and a *rejected* submission still consumes
