@@ -1,6 +1,16 @@
-Rebuild of the Flyte devbox AMI on the current flyte-devbox release.
+Adds an optional Spot instance mode (UseSpot), which is significantly cheaper
+than on-demand and most worthwhile on GPU instance types. Being reclaimed stops
+the devbox rather than terminating it, so the data volume, the address and the
+load balancer registration survive and it restarts when capacity returns; work
+in flight is restarted from the beginning.
 
-The CloudFormation launch form has been reorganised so the parameters are
+Fixes a storage bug that affected every deployment: Kubernetes cluster state was
+being kept on the instance root volume rather than the persistent data volume, so
+it was not covered by the nightly backup and did not survive instance
+replacement. It now lives on the data volume, as the documentation already
+described.
+
+The CloudFormation launch form has also been reorganised so the parameters are
 grouped and ordered by what you actually need to decide: the deployment route
 first, then network access, then sizing. The Domain and AllowedCidr fields now
 state plainly which route each one belongs to, and that the evaluation route

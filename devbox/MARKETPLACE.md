@@ -126,6 +126,19 @@ bucket. So the script uploads the nested templates under **stable names** to
 `devbox/templates/` and does the rewrite itself, rather than calling `package`.
 The uploaded names must stay in step with the `NESTED` table in the script.
 
+## 3c. Where cluster state actually lives
+
+k3s state is the `flyte-k3s-data` **named docker volume**, which sits under
+docker's `data-root`. The user-data moves that root onto the EBS data volume at
+first boot (one-time `tar` copy, then `data-root` in `daemon.json`). Before that
+fix it sat on the instance root volume - `DeleteOnTermination: true`, and not the
+volume `BackupSelection` tags - so the nightly snapshot captured `storage/` and
+nothing else, and any instance replacement silently discarded the cluster.
+
+If you change the data-volume mount, the docker migration or the `flyte-k3s-data`
+mount, check all three together. Two comments in the templates claimed this
+arrangement long before it was true.
+
 ## 4. CloudFormation product wiring
 
 These are the rules the CloudFormation review actually enforces — each one below

@@ -28,6 +28,7 @@ Metadata:
           default: "Size and cost"
         Parameters:
           - InstanceType
+          - UseSpot
           - DataVolumeSizeGb
           - AutoStop
           - IdleThresholdMinutes
@@ -47,6 +48,7 @@ Metadata:
       StableIp: {default: "Allocate an Elastic IP"}
       VpcCidr: {default: "VPC CIDR"}
       InstanceType: {default: "Instance type"}
+      UseSpot: {default: "Use a Spot instance (cheaper, can be interrupted)"}
       DataVolumeSizeGb: {default: "Data volume size (GiB)"}
       AutoStop: {default: "Auto-stop when idle"}
       IdleThresholdMinutes: {default: "Idle minutes before auto-stop"}
@@ -86,6 +88,25 @@ Parameters:
       EC2 instance type for the devbox host. Default m6i.2xlarge = 8 vCPU / 32 GB RAM,
       ~$9.20/day on-demand in us-east-1. The devbox runs k3s + Flyte + your
       workloads; 2 vCPU machines (t3.large etc.) starve quickly under any real load.
+
+  UseSpot:
+    Type: String
+    Default: "No"
+    AllowedValues: ["Yes", "No"]
+    Description: |
+      Run the devbox on a Spot instance. Spot is much cheaper than on-demand - the
+      gap is largest on GPU instance types - but AWS can reclaim the capacity at
+      any time.
+      Reclaiming STOPS the devbox rather than terminating it, which is the same
+      thing the idle auto-stop already does: the data volume, the instance ID, the
+      Elastic IP and the load balancer registration all survive, and the devbox
+      comes back when capacity does. What does NOT survive is work in flight - a
+      running task is killed and restarted from the beginning, so a long training
+      run can lose hours.
+      Good choice for interactive and batch work you can afford to repeat; poor
+      choice for a long unattended run you need to finish on a deadline.
+      Note that a Spot devbox may sit stopped waiting for capacity, so do not use
+      it where you need the box available on demand.
 
   DataVolumeSizeGb:
     Type: Number
@@ -392,8 +413,9 @@ Resources:
           Description: HTTPS
 
   # -------------------------------------------------------------------------
-  # Dedicated EBS volume for /var/lib/docker. Survives EC2 replacement; daily
-  # AWS Backup snapshot with 7-day retention.
+  # Dedicated EBS volume holding Flyte storage AND docker's data-root, which is
+  # where k3s state lives (the flyte-k3s-data named volume). Survives EC2 stop,
+  # interruption and replacement; daily AWS Backup snapshot, 7-day retention.
   # -------------------------------------------------------------------------
   DataVolume:
     Type: AWS::EC2::Volume
@@ -555,6 +577,7 @@ Resources:
         Domain: !Ref Domain
         RootStackName: !Ref AWS::StackName
         InstanceType: !Ref InstanceType
+        UseSpot: !Ref UseSpot
         IdleThresholdMinutes: !Ref IdleThresholdMinutes
         DevboxImage: !Ref DevboxImage
         ImageId: !If [HasAmiId, !Ref AmiId, !Ref AmiSsmParameter]
