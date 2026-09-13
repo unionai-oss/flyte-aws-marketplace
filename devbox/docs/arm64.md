@@ -65,7 +65,43 @@ is claimed to work.
 each arch's id to its own SSM parameter, with the existing gate preserved: the
 pointer is only written after that arch's smoke test passes.
 
-## The open question — Marketplace
+## How other sellers do it (researched 2026-09-13)
+
+The question is settled well enough to design against, and the answer is
+**separate listings**.
+
+- The CloudFormation delivery docs say a template "can be configured to deliver
+  a **single** Amazon Machine Image (AMI)". A single-AMI solution may carry up to
+  three CloudFormation templates, but those are alternative *topologies or
+  configurations*, not architectures - the Catalog API separately requires that
+  all delivery options in a version share one `AmiSource`.
+- The architecture policy says AMIs "must use x86-64 **or** 64-bit ARM
+  architecture" - one or the other, per AMI, and an AMI is single-architecture by
+  construction.
+- The Management Portal's add-version flow makes you pick an architecture
+  (X64 vs ARM) and then give one AMI, with no way to attach a second AMI for a
+  second architecture. Sellers have asked AWS for this directly and been left
+  creating separate listings.
+- What shipping products actually do: ARM builds appear as their own listings -
+  "Rocky Linux 9 (ARM)", "Alma Linux 9 (ARM)" - sitting alongside their x86
+  counterparts rather than inside them.
+
+A second listing is affordable: the default cap is 75 public AMI listings per
+seller. The cost is duplicated listing copy, pricing and support metadata, and a
+second submission pipeline - `MARKETPLACE_PRODUCT_ID` would become per-arch, and
+`submit-version.sh` would need to pick the right one alongside the right AMI.
+
+Two adjacent findings worth keeping:
+
+- **Test 'Add Version'** exists in the Management Portal: it runs the scan and
+  returns consolidated feedback, typically within an hour, *before* a formal
+  submission. Given how much of this has been learned by rejection, that is worth
+  using on the first arm64 version.
+- **Version archival**: a version restricted for over two years is archived, and
+  an archived version unused for 13 months is permanently deleted. Relevant if an
+  arm64 listing stays quiet.
+
+## The remaining open question — Marketplace
 
 Unresolved, and it decides whether arm64 can reach buyers at all:
 
@@ -79,10 +115,13 @@ serve both architectures. `TemplateSources` being an array leaves room for the
 opposite reading, but that is a guess about an API whose behaviour has
 repeatedly differed from its documentation.
 
-Cheap way to settle it: build the arm64 AMI, then `DRY_RUN=1` a change set whose
-`TemplateSources` has two entries (`AmiId` → x86_64, `AmiIdArm64` → arm64) and
-submit it with `Intent=VALIDATE` in **add** mode — add accepts Intent, so this
-costs no version title. AWS's answer settles the design.
+Cheap way to settle it definitively: build the arm64 AMI, then submit a change
+set whose `TemplateSources` has two entries (`AmiId` → x86_64, `AmiIdArm64` →
+arm64) with `Intent=VALIDATE` in **add** mode - add accepts Intent, so this costs
+no version title. Everything above says it will be refused; do it anyway, because
+this API has contradicted its own documentation repeatedly (see
+`UpdateDeliveryOptions` accepting `Template` on paper and rejecting it in
+practice), and a minute of validation beats reasoning from docs.
 
 If it is one AMI per version, the options are two versions (buyer picks) or a
 second listing; neither is obviously right, and that decision should be made
