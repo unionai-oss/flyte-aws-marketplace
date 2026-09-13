@@ -224,8 +224,18 @@ template_details = {
 }
 
 if mode == "update":
-    # UpdateDeliveryOptions carries no VersionTitle - it edits a version that
-    # already has one - so there is no title to collide and none to consume.
+    # UpdateDeliveryOptions is LISTING COPY ONLY. The API rejects Template
+    # outright -
+    #   "DeploymentTemplateDeliveryOptionDetails has properties which are not
+    #    allowed: ['Template']"
+    # - even though the docs list it as updatable. That is consistent with how
+    # versions work: the template was reviewed as part of a version, so changing
+    # what buyers deploy under an already-reviewed version is not on offer.
+    # A template change therefore needs a NEW VERSION, which needs a NEW AMI,
+    # because every version must carry a distinct AMI id.
+    template_details.pop("Template", None)
+    # It carries no VersionTitle either - it edits a version that already has
+    # one - so there is no title to collide and none to consume.
     print(json.dumps([{
         "ChangeType": "UpdateDeliveryOptions",
         "Entity": {"Type": "AmiProduct@1.0", "Identifier": entity_identifier},
@@ -292,6 +302,17 @@ if [[ "${MODE}" == "add" ]]; then
   echo "   ami:      ${AMI_ID}"
 else
   echo "   entity:   ${ENTITY_IDENTIFIER}   (AMI unchanged)"
+  cat <<'COPYONLY'
+
+   NOTE: update mode changes LISTING COPY ONLY - title, descriptions, usage
+   instructions, recommended instance type. The CloudFormation template is NOT
+   updated: AWS rejects Template on this change type, because the template was
+   reviewed as part of that version.
+
+   If your change includes template changes, this will not ship them. Build a
+   new AMI and submit a new version instead (workflow input force: true, or
+   AMI_ID=<new ami> with MODE=add).
+COPYONLY
 fi
 echo "   template: ${TEMPLATE_URL}"
 echo "${CHANGE_SET}" | python3 -m json.tool

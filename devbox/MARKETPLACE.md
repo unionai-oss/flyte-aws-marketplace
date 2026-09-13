@@ -226,9 +226,26 @@ be a new version**:
 
 | change | mode | change type |
 |---|---|---|
-| new AMI (+ template + copy) | `MODE=add` | `AddDeliveryOptions` |
-| template, diagram or copy only | `MODE=update` | `UpdateDeliveryOptions` |
+| anything touching the TEMPLATE, or a new AMI | `MODE=add` | `AddDeliveryOptions` |
+| listing copy only (titles, descriptions, usage instructions) | `MODE=update` | `UpdateDeliveryOptions` |
 | let it work that out | `MODE=auto` (default) | either |
+
+**A template change cannot be shipped as an update.** The API rejects `Template`
+on `UpdateDeliveryOptions` -
+
+```
+DeploymentTemplateDeliveryOptionDetails has properties which are not
+allowed: ['Template']
+```
+
+- despite the docs listing it as updatable. That is consistent with how versions
+work: the template was reviewed as part of a version, so changing what buyers
+deploy under an already-reviewed version is not on offer. Combined with the
+distinct-AMI rule, shipping a template change means **a new AMI and a new
+version**, even when the devbox image itself has not moved. Force one with the
+workflow's `force: true` input, or build locally and pass `AMI_ID=`.
+
+So `MODE=update` is for listing copy only, and says so when it runs.
 
 ```bash
 VALIDATE_ONLY=1 scripts/submit-version.sh    # auto-resolves, validates, creates nothing
