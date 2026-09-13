@@ -45,6 +45,19 @@ for tool in aws python3 "$FLYTE"; do
     exit 1; }
 done
 
+# Snapshots left behind by the Aurora cluster's DeletionPolicy: Snapshot. A
+# deletion policy cannot be conditional, so every teardown of this throwaway
+# stack takes a final snapshot of a database nobody will ever read - and they
+# accumulate and bill forever. Sweep them.
+delete_smoke_db_snapshots() {
+  for s in $(aws_ rds describe-db-cluster-snapshots --snapshot-type manual \
+               --query "DBClusterSnapshots[?starts_with(DBClusterSnapshotIdentifier, '${STACK_NAME}')].DBClusterSnapshotIdentifier" \
+               --output text 2>/dev/null); do
+    aws_ rds delete-db-cluster-snapshot --db-cluster-snapshot-identifier "$s" >/dev/null 2>&1 \
+      && echo "  deleted leftover snapshot $s" || true
+  done
+}
+
 teardown() {
   if [ "${KEEP:-0}" = "1" ]; then
     log "KEEP=1 — leaving $STACK_NAME up for inspection (delete it manually when done)"; return
@@ -54,15 +67,26 @@ teardown() {
     --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text 2>/dev/null || true)
   [ -n "${BUCKET:-}" ] && [ "$BUCKET" != "None" ] && aws_ s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
   aws_ cloudformation delete-stack --stack-name "$STACK_NAME" >/dev/null 2>&1 || true
-  aws_ cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" 2>/dev/null || true
-  # Delete resources whose DeletionPolicy is Retain/Snapshot — they survive the
-  # stack and, having deterministic names (${StackName}-flyte, -flyte-data),
-  # would make the NEXT run's CREATE change-set fail. Best-effort.
-  for r in $(aws_ ecr describe-repositories --query "repositories[?starts_with(repositoryName, '${STACK_NAME}-flyte/')].repositoryName" --output text 2>/dev/null); do
-    aws_ ecr delete-repository --repository-name "$r" --force >/dev/null 2>&1 || true
-  done
-  aws_ backup delete-backup-vault --backup-vault-name "${STACK_NAME}-flyte-data" >/dev/null 2>&1 || true
-  log "Teardown complete"
+
+  # Deleting this stack takes ~15 minutes, almost all of it Aurora, and it gates
+  # NOTHING: the pass/fail is already decided by the time we get here. Blocking
+  # on it was nearly half the job's wall clock. So by default we issue the delete
+  # and leave: CloudFormation finishes on its own, and the pre-clean at the top of
+  # the next run reconciles whatever is left over. TEARDOWN_WAIT=1 restores the
+  # old behaviour for when you want the account clean before the script returns.
+  if [ "${TEARDOWN_WAIT:-0}" = "1" ]; then
+    aws_ cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" 2>/dev/null || true
+    # Retain/Snapshot resources survive the stack and, having deterministic
+    # names, would fail the NEXT run's CREATE. Best-effort.
+    for r in $(aws_ ecr describe-repositories --query "repositories[?starts_with(repositoryName, '${STACK_NAME}-flyte/')].repositoryName" --output text 2>/dev/null); do
+      aws_ ecr delete-repository --repository-name "$r" --force >/dev/null 2>&1 || true
+    done
+    aws_ backup delete-backup-vault --backup-vault-name "${STACK_NAME}-flyte-data" >/dev/null 2>&1 || true
+    delete_smoke_db_snapshots
+    log "Teardown complete"
+  else
+    log "Teardown: delete issued, not waiting (TEARDOWN_WAIT=1 to block). The next run reconciles leftovers."
+  fi
 }
 trap teardown EXIT
 
@@ -80,9 +104,15 @@ if aws_ cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&
 fi
 # Also clear Retain/Snapshot resources a prior (or KEEP=1) run may have left —
 # their deterministic names would otherwise make the CREATE change-set fail.
+# This is also where a non-waiting teardown's leftovers get reconciled, so it
+# has to cover everything teardown would have swept.
 aws_ ecr delete-repository --repository-name "${STACK_NAME}-flyte" --force >/dev/null 2>&1 || true
+for r in $(aws_ ecr describe-repositories --query "repositories[?starts_with(repositoryName, '${STACK_NAME}-flyte/')].repositoryName" --output text 2>/dev/null); do
+  aws_ ecr delete-repository --repository-name "$r" --force >/dev/null 2>&1 || true
+done
 aws_ backup delete-backup-vault --backup-vault-name "${STACK_NAME}-flyte-data" >/dev/null 2>&1 || true
 aws_ s3 rb "s3://${STACK_NAME}-flyte-${ACCOUNT}-${REGION}" --force >/dev/null 2>&1 || true
+delete_smoke_db_snapshots
 # Package the nested templates to S3, then create-change-set + execute (more
 # robust than `cloudformation deploy`, whose early-validation hook is flaky).
 PACKAGED="$(mktemp -t packaged-XXXX.yaml)"
