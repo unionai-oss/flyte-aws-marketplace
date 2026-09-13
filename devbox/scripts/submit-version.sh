@@ -19,15 +19,24 @@
 # existing version is rejected with "Duplicate AMI id", so a template- or
 # copy-only change cannot be a new version at all:
 #
-#   MODE=add     (default) a genuinely new version: new AMI + template + copy,
-#                sent as AddDeliveryOptions. Needs an AMI id no version has used.
+#   MODE=add     a genuinely new version: new AMI + template + copy, sent as
+#                AddDeliveryOptions. Needs an AMI id no version has used.
 #   MODE=update  change the template, diagram or listing copy of an EXISTING
 #                version in place, sent as UpdateDeliveryOptions. Touches no AMI
 #                and consumes no version title.
+#   MODE=auto    (default) ask the listing which of those is legal and do that.
+#
+# auto is not a guess. AWS decides it: if the AMI we would submit is already used
+# by an existing version, "add" is not a choice that exists - it is rejected as a
+# duplicate - so the only legal action is to update that version. If the AMI is
+# new to the listing, "add" is correct. So auto reads the versions off the
+# listing, looks for our AMI id, and picks accordingly. It refuses to guess when
+# it cannot read them, rather than defaulting to one and hoping.
 #
 # Usage:
-#   scripts/submit-version.sh                    # new version (needs a new AMI)
-#   MODE=update scripts/submit-version.sh        # retarget an existing version
+#   scripts/submit-version.sh                    # figure it out
+#   MODE=update scripts/submit-version.sh        # force: retarget an existing version
+#   MODE=add scripts/submit-version.sh           # force: new version
 #   DRY_RUN=1 scripts/submit-version.sh          # print the change set, send nothing
 #   VALIDATE_ONLY=1 scripts/submit-version.sh    # run AWS's validation, create nothing
 #
@@ -40,8 +49,8 @@ source "${REPO_ROOT}/versions.env"
 LISTING="${REPO_ROOT}/listing"
 MANIFEST="${REPO_ROOT}/.package-manifest.json"
 AWS_REGION="${AWS_REGION:-us-east-1}"
-MODE="${MODE:-add}"
-case "${MODE}" in add|update) ;; *) echo "MODE must be 'add' or 'update', got '${MODE}'" >&2; exit 1;; esac
+MODE="${MODE:-auto}"
+case "${MODE}" in add|update|auto) ;; *) echo "MODE must be 'add', 'update' or 'auto', got '${MODE}'" >&2; exit 1;; esac
 
 : "${MARKETPLACE_PRODUCT_ID:?set MARKETPLACE_PRODUCT_ID in devbox/versions.env (the prod-... id from the portal URL)}"
 
@@ -69,79 +78,65 @@ case "${TEMPLATE_URL}" in
     exit 1;;
 esac
 
-# --- the AMI (add mode only) -------------------------------------------------
-# Deliberately not read in update mode: the AMI of an existing version is exactly
-# what must NOT change, and sending TemplateSources with the AMI already on that
-# version is what produces "Duplicate AMI id".
-if [[ "${MODE}" == "add" ]]; then
-# Read it from SSM rather than taking it as an argument: the AMI pipeline writes
-# that parameter only after the smoke test passes, so a submission cannot name an
-# image that was never validated.
-AMI_ID="${AMI_ID:-$(aws ssm get-parameter --name "${AMI_PARAM}" --region "${AWS_REGION}" \
-                      --query Parameter.Value --output text)}"
-[[ "${AMI_ID}" == ami-* ]] || { echo "FAIL: ${AMI_PARAM} holds '${AMI_ID}', not an AMI id" >&2; exit 1; }
+# --- the AMI -----------------------------------------------------------------
+# Read from SSM rather than taken as an argument: the AMI pipeline writes that
+# parameter only after the smoke test passes, so a submission cannot name an
+# image that was never validated. Needed in add mode to submit, and in auto mode
+# to work out whether the listing has already used it. Update mode never sends
+# it - the AMI of an existing version is exactly what must not change.
+if [[ "${MODE}" != "update" ]]; then
+  AMI_ID="${AMI_ID:-$(aws ssm get-parameter --name "${AMI_PARAM}" --region "${AWS_REGION}" \
+                        --query Parameter.Value --output text)}"
+  [[ "${AMI_ID}" == ami-* ]] || { echo "FAIL: ${AMI_PARAM} holds '${AMI_ID}', not an AMI id" >&2; exit 1; }
 
-# The Catalog API only exists in us-east-1 and only sees AMIs in the calling
-# account there, so a copied-to-another-region AMI id fails ingestion with a
-# confusing ASSET_NOT_FOUND. Catch it here instead.
-aws ec2 describe-images --image-ids "${AMI_ID}" --region us-east-1 \
-  --owners self --query 'Images[0].ImageId' --output text >/dev/null 2>&1 || {
-  echo "FAIL: ${AMI_ID} is not an AMI owned by this account in us-east-1." >&2
-  echo "      Marketplace ingests only from us-east-1 in the seller account." >&2
-  exit 1; }
+  # The Catalog API only exists in us-east-1 and only sees AMIs in the calling
+  # account there, so a copied-to-another-region AMI id fails ingestion with a
+  # confusing ASSET_NOT_FOUND. Catch it here instead.
+  aws ec2 describe-images --image-ids "${AMI_ID}" --region us-east-1 \
+    --owners self --query 'Images[0].ImageId' --output text >/dev/null 2>&1 || {
+    echo "FAIL: ${AMI_ID} is not an AMI owned by this account in us-east-1." >&2
+    echo "      Marketplace ingests only from us-east-1 in the seller account." >&2
+    exit 1; }
 fi
 
-# --- the target version (update mode only) -----------------------------------
-# UpdateDeliveryOptions addresses one delivery option on one version, so it needs
-# the entity identifier with its @version suffix and the delivery option's id.
-# Both come from DescribeEntity. The response is walked tolerantly rather than
-# by a fixed path, and printed, so an unexpected shape is visible instead of
-# silently producing a change set aimed at the wrong thing. Override either with
-# ENTITY_IDENTIFIER= / DELIVERY_OPTION_ID= if the discovery picks wrong.
-if [[ "${MODE}" == "update" ]]; then
-  echo ">> describing ${MARKETPLACE_PRODUCT_ID} to find the version to update"
+# --- resolve the mode and the update target ----------------------------------
+# One DescribeEntity serves both jobs: deciding add-vs-update, and finding the
+# entity identifier (with its @version suffix) and delivery option id that
+# UpdateDeliveryOptions has to address. The response is walked tolerantly rather
+# than by a fixed path, and printed, so an unexpected shape is visible instead of
+# silently producing a change set aimed at the wrong thing.
+if [[ "${MODE}" != "add" ]]; then
+  echo ">> describing ${MARKETPLACE_PRODUCT_ID}"
   ENTITY_JSON="$(aws marketplace-catalog describe-entity --catalog AWSMarketplace \
     --region "${AWS_REGION}" --entity-id "${MARKETPLACE_PRODUCT_ID}" --output json)"
 
-  DISCOVERED="$(python3 - "${ENTITY_JSON}" <<'PYD'
-import json, sys
-e = json.loads(sys.argv[1])
-doc = e.get("DetailsDocument")
-if doc is None and isinstance(e.get("Details"), str):
-    doc = json.loads(e["Details"])          # older shape: Details is a JSON string
-doc = doc or {}
-
-# Collect every delivery option that carries CloudFormation template details,
-# wherever it sits, remembering the version it belongs to.
-found = []
-def walk(node, version):
-    if isinstance(node, dict):
-        v = node.get("VersionTitle") or node.get("Id") if "DeliveryOptions" in node else None
-        for opt in node.get("DeliveryOptions") or []:
-            if isinstance(opt, dict) and "DeploymentTemplateDeliveryOptionDetails" in (opt.get("Details") or {}):
-                found.append({"option_id": opt.get("Id"),
-                              "version": node.get("VersionTitle") or version,
-                              "visibility": opt.get("Visibility")})
-        for k, val in node.items():
-            walk(val, node.get("VersionTitle") or version)
-    elif isinstance(node, list):
-        for item in node:
-            walk(item, version)
-walk(doc, None)
-
-print(json.dumps({
-    "entity_identifier": e.get("EntityIdentifier") or e.get("EntityArn"),
-    "options": found,
-}))
-PYD
-)"
+  DISCOVERED="$(python3 "${REPO_ROOT}/scripts/describe-entity.py" "${ENTITY_JSON}" "${AMI_ID:-}")"
   echo "${DISCOVERED}" | python3 -m json.tool
 
+  if [[ "${MODE}" == "auto" ]]; then
+    RESOLVED="$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["resolution"])' "${DISCOVERED}")"
+    case "${RESOLVED}" in
+      add)
+        MODE=add
+        echo ">> auto: ${AMI_ID} is not on any existing version - adding a new one";;
+      update)
+        MODE=update
+        echo ">> auto: ${AMI_ID} is already on an existing version, so a new version would be";
+        echo "   rejected as a duplicate - updating that version in place instead";;
+      *)
+        echo "FAIL: cannot tell whether ${AMI_ID:-<no ami>} is already on a version." >&2
+        echo "      Reason: ${RESOLVED}" >&2
+        echo "      The DescribeEntity result above is what it had to work with." >&2
+        echo "      Re-run with MODE=add or MODE=update once you have decided." >&2
+        exit 1;;
+    esac
+  fi
+fi
+
+if [[ "${MODE}" == "update" ]]; then
+  # Override either if the discovery picks wrong.
   ENTITY_IDENTIFIER="${ENTITY_IDENTIFIER:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["entity_identifier"] or "")' "${DISCOVERED}")}"
-  DELIVERY_OPTION_ID="${DELIVERY_OPTION_ID:-$(python3 -c '
-import json,sys
-o=json.loads(sys.argv[1])["options"]
-print(o[-1]["option_id"] if len(o)==1 else "")' "${DISCOVERED}")}"
+  DELIVERY_OPTION_ID="${DELIVERY_OPTION_ID:-$(python3 -c 'import json,sys;print(json.loads(sys.argv[1])["target_option_id"] or "")' "${DISCOVERED}")}"
 
   [[ -n "${ENTITY_IDENTIFIER}" ]] || {
     echo "FAIL: could not read the entity identifier from DescribeEntity." >&2

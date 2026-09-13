@@ -208,13 +208,27 @@ be a new version**:
 
 | change | mode | change type |
 |---|---|---|
-| new AMI (+ template + copy) | `MODE=add` (default) | `AddDeliveryOptions` |
+| new AMI (+ template + copy) | `MODE=add` | `AddDeliveryOptions` |
 | template, diagram or copy only | `MODE=update` | `UpdateDeliveryOptions` |
+| let it work that out | `MODE=auto` (default) | either |
 
 ```bash
-MODE=update VALIDATE_ONLY=1 scripts/submit-version.sh
-MODE=update scripts/submit-version.sh
+VALIDATE_ONLY=1 scripts/submit-version.sh    # auto-resolves, validates, creates nothing
+scripts/submit-version.sh                    # auto-resolves and submits
 ```
+
+`auto` is not a heuristic - AWS decides it. If the AMI we would submit is already
+on a version, `add` is not a choice that exists (it is rejected as a duplicate),
+so updating that version is the only legal action; if the AMI is new to the
+listing, `add` is correct. `scripts/describe-entity.py` reads the versions off
+the listing and picks. It **refuses rather than defaults** when it cannot tell -
+if `DescribeEntity` returns no AMI ids, "add" might be a duplicate and "update"
+might target the wrong version, so it stops and asks for an explicit `MODE`.
+
+The duplicate check spans every AMI on the listing, not just the ones on
+CloudFormation delivery options: AWS scopes the rule to the product, so an AMI
+used by any other kind of option collides too. The update *target*, though, can
+only be a CloudFormation option.
 
 Update mode edits an existing version in place. It sends no `TemplateSources`
 (the AMI is exactly what must not change) and no `VersionTitle`, so it consumes

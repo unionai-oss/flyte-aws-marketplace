@@ -46,6 +46,9 @@ if [ -n "$PY" ]; then
   comp_ok=1
   "$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$PFILES/idle-agent.py" \
     || { bad "syntax error: idle-agent.py"; comp_ok=0; }
+  # Load-bearing at submit time: it decides add-vs-update against the listing.
+  "$PY" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$ROOT/scripts/describe-entity.py" \
+    || { bad "syntax error: describe-entity.py"; comp_ok=0; }
   # Inline Lambda ZipFiles in the template (WakeLambda + StopLambda).
   "$PY" - "$TEMPLATE" <<'PYEOF' || comp_ok=0
 import ast,sys
