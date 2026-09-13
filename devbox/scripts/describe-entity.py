@@ -34,11 +34,18 @@ def _details(entity):
     return doc or {}
 
 
+# DescribeEntity and the change-set schema spell the same thing differently:
+# a version's AMI arrives as Sources[].Image here, and as
+# TemplateSources[].AmiSource.AmiId there. Accept both - looking only for AmiId
+# is what made a listing with three published versions read as empty.
+AMI_KEYS = ("AmiId", "Image")
+
+
 def _ami_ids(node, acc):
-    """Every AmiId anywhere under this node."""
+    """Every AMI id anywhere under this node, under either spelling."""
     if isinstance(node, dict):
         for k, v in node.items():
-            if k == "AmiId" and isinstance(v, str):
+            if k in AMI_KEYS and isinstance(v, str) and v.startswith("ami-"):
                 acc.add(v)
             else:
                 _ami_ids(v, acc)
@@ -46,6 +53,56 @@ def _ami_ids(node, acc):
         for item in node:
             _ami_ids(item, acc)
     return acc
+
+
+def _is_cft(option):
+    """Does this delivery option deliver a CloudFormation template?
+
+    DescribeEntity labels it with a Type; the change-set schema instead nests
+    DeploymentTemplateDeliveryOptionDetails. Recognise either.
+    """
+    if "DeploymentTemplateDeliveryOptionDetails" in (option.get("Details") or {}):
+        return True
+    label = " ".join(str(option.get(k, "")) for k in ("Type", "DeliveryOptionType"))
+    return "cloudformation" in label.lower() or "template" in label.lower()
+
+
+def _from_versions(versions):
+    """The structured path: DetailsDocument.Versions[] as DescribeEntity returns it.
+
+    The AMI sits at VERSION level (Sources[].Image), not inside the delivery
+    option, so options inherit their version's AMI ids rather than being
+    searched individually.
+    """
+    out = []
+    for v in versions:
+        if not isinstance(v, dict):
+            continue
+        amis = sorted(_ami_ids(v, set()))
+        options = [o for o in (v.get("DeliveryOptions") or []) if isinstance(o, dict)]
+        for o in options:
+            out.append({
+                "option_id": o.get("Id"),
+                "version": v.get("VersionTitle") or v.get("Id"),
+                "version_id": v.get("Id"),
+                "type": o.get("Type") or o.get("DeliveryOptionType"),
+                "is_cloudformation": _is_cft(o),
+                "visibility": o.get("Visibility"),
+                "ami_ids": amis,
+            })
+        if not options:
+            # A version with no delivery options we can see still carries AMIs
+            # that count against the duplicate rule.
+            out.append({
+                "option_id": None,
+                "version": v.get("VersionTitle") or v.get("Id"),
+                "version_id": v.get("Id"),
+                "type": None,
+                "is_cloudformation": False,
+                "visibility": None,
+                "ami_ids": amis,
+            })
+    return out
 
 
 def _options(node, version, out):
@@ -94,7 +151,13 @@ def main():
     ami_id = sys.argv[2] if len(sys.argv) > 2 else ""
 
     doc = _details(entity)
-    options = _options(doc, None, [])
+    # Prefer the documented DescribeEntity shape; fall back to the tolerant walk
+    # for anything that does not present a Versions[] list.
+    versions = doc.get("Versions")
+    if isinstance(versions, list) and versions:
+        options = _from_versions(versions)
+    else:
+        options = _options(doc, None, [])
 
     # De-duplicate: the tolerant walk can reach the same option by two paths.
     seen, unique = set(), []
@@ -128,13 +191,18 @@ def main():
     elif ami_id in published:
         # Already on the listing, so adding it again is not a choice that exists.
         result["resolution"] = "update"
-        if match:
+        cft = [o for o in options
+               if o.get("option_id") and o.get("is_cloudformation", True)
+               and ami_id in o["ami_ids"]]
+        if cft:
+            match = cft[0]
+        if match and match.get("option_id"):
             result["target_option_id"] = match["option_id"]
             if match is not options[-1]:
                 result["note"] = ("the AMI is on a version that is not the last one listed; "
                                   "check entity_identifier points at that version")
-        elif len(options) == 1:
-            result["target_option_id"] = options[0]["option_id"]
+        elif len([o for o in options if o.get("option_id")]) == 1:
+            result["target_option_id"] = next(o["option_id"] for o in options if o.get("option_id"))
             result["note"] = ("the AMI was not found on a CloudFormation delivery option, "
                               "but there is only one, so that is the target")
         else:
