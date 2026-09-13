@@ -116,8 +116,21 @@ anything, so a bad payload is caught before a version exists.
 `devbox-smoke`. Removing the gate first leaves the old, over-powered role
 ungated.
 
-What a reviewer still buys you: the smoke test spends real money (Aurora, an ALB,
-an EC2, ~30 minutes), and nothing here caps that.
+The spend that the reviewer also used to watch is covered by a budget instead.
+`infra/seller-account-setup.sh` creates a monthly cost budget of $100 alerting at
+50% ($50) and 100% ($100), plus a forecast alert so it warns on the way there
+rather than after the fact. Pass the address — it is deliberately not baked in:
+
+```bash
+BUDGET_EMAIL=you@example.com AWS_PROFILE=union-seller infra/seller-account-setup.sh
+```
+
+AWS emails a confirmation for a new subscriber address; accept it or the alerts
+never arrive. The smoke role is denied `budgets:*` and `ce:*`, so the thing being
+watched cannot delete its own alarm.
+
+A budget alerts, it does not stop anything — it tells you a loop is running, it
+will not end one.
 
 Run with `skip_smoke: true` to bypass it — that publishes an unvalidated AMI to
 SSM, which is exactly what the smoke test exists to prevent, so treat it as a

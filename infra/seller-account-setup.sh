@@ -230,6 +230,12 @@ cat > "${WORK}/smoke-iam.json" <<EOF
       "Resource": "arn:aws:ssm:*:${ACCOUNT}:parameter/flyte-devbox/*"
     },
     {
+      "Sid": "NoTouchingItsOwnCostAlarm",
+      "Effect": "Deny",
+      "Action": ["budgets:*", "ce:*"],
+      "Resource": "*"
+    },
+    {
       "Sid": "NoMarketplacePublishing",
       "Effect": "Deny",
       "Action": ["aws-marketplace:*"],
@@ -250,6 +256,60 @@ aws iam put-role-policy --role-name github-actions-flyte-devbox-smoke \
   --policy-name flyte-devbox-smoke-guardrails \
   --policy-document "file://${WORK}/smoke-iam.json"
 
+# ---- 3. cost alarms -------------------------------------------------------
+# The smoke test deploys Aurora + an ALB + an EC2 for ~30 minutes per run, and
+# nothing in the pipeline caps that. With the reviewer gate off, a loop or a bad
+# merge can run it repeatedly, so the budget is the backstop that used to be a
+# human looking at the approval prompt.
+#
+# One MONTHLY COST budget of $100 with alerts at 50% ($50) and 100% ($100), plus
+# a forecast alert so it warns on the way there rather than after the fact.
+#
+# The notification address is not baked in - pass it:
+#   BUDGET_EMAIL=you@example.com AWS_PROFILE=union-seller infra/seller-account-setup.sh
+BUDGET_EMAIL="${BUDGET_EMAIL:-}"
+BUDGET_NAME="flyte-marketplace-monthly"
+if [ -z "${BUDGET_EMAIL}" ]; then
+  echo
+  echo ">> BUDGET_EMAIL not set — skipping the cost alarms."
+  echo "   Re-run with BUDGET_EMAIL=you@example.com to create them."
+else
+  cat > "${WORK}/budget.json" <<EOF
+{
+  "BudgetName": "${BUDGET_NAME}",
+  "BudgetLimit": {"Amount": "100", "Unit": "USD"},
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}
+EOF
+  cat > "${WORK}/budget-notifications.json" <<EOF
+[
+  {"Notification": {"NotificationType": "ACTUAL", "ComparisonOperator": "GREATER_THAN",
+                    "Threshold": 50, "ThresholdType": "PERCENTAGE"},
+   "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "${BUDGET_EMAIL}"}]},
+  {"Notification": {"NotificationType": "ACTUAL", "ComparisonOperator": "GREATER_THAN",
+                    "Threshold": 100, "ThresholdType": "PERCENTAGE"},
+   "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "${BUDGET_EMAIL}"}]},
+  {"Notification": {"NotificationType": "FORECASTED", "ComparisonOperator": "GREATER_THAN",
+                    "Threshold": 100, "ThresholdType": "PERCENTAGE"},
+   "Subscribers": [{"SubscriptionType": "EMAIL", "Address": "${BUDGET_EMAIL}"}]}
+]
+EOF
+  # Idempotent by replacement: the API has no way to reconcile a budget's
+  # notification set in place, and a budget is pure alarm config with no history
+  # worth preserving, so re-running rebuilds it.
+  if aws budgets describe-budget --account-id "${ACCOUNT}" \
+       --budget-name "${BUDGET_NAME}" >/dev/null 2>&1; then
+    echo ">> ${BUDGET_NAME} exists — recreating it so the thresholds match this script"
+    aws budgets delete-budget --account-id "${ACCOUNT}" --budget-name "${BUDGET_NAME}"
+  fi
+  aws budgets create-budget --account-id "${ACCOUNT}" \
+    --budget "file://${WORK}/budget.json" \
+    --notifications-with-subscribers "file://${WORK}/budget-notifications.json"
+  echo ">> cost alarms: \$50 and \$100 actual, \$100 forecast -> ${BUDGET_EMAIL}"
+  echo "   AWS emails a confirmation for a new address; accept it or the alerts never arrive."
+fi
+
 echo
 echo "Now set the repo variables so the workflows can find the roles:"
 echo "  gh variable set AWS_PUBLISH_ROLE_ARN --repo ${REPO} \\"
@@ -257,5 +317,7 @@ echo "    --body arn:aws:iam::${ACCOUNT}:role/github-actions-flyte-marketplace"
 echo "  gh variable set AWS_SMOKE_ROLE_ARN --repo ${REPO} \\"
 echo "    --body arn:aws:iam::${ACCOUNT}:role/github-actions-flyte-devbox-smoke"
 echo
-echo "And put REQUIRED REVIEWERS on the devbox-smoke environment before the"
-echo "first run — see the comment above the smoke role."
+echo
+echo "Reviewers on devbox-smoke / marketplace-publish are now optional — see"
+echo ".github/workflows/README.md, 'Unattended runs'. Re-run THIS script before"
+echo "removing them: it is what downgrades the smoke role."
