@@ -340,25 +340,66 @@ submit() {  # $1 = Intent, or "" for none
     --query ChangeSetId --output text
 }
 
+# Poll a change set to a terminal state and say what happened.
+#
+# AWS validates asynchronously. This used to fire VALIDATE and then immediately
+# APPLY, which made the rehearsal decoration - the result arrived long after the
+# version had been created. Now validation actually gates the submission.
+#
+# Returns 0 SUCCEEDED, 1 FAILED/CANCELLED, 2 still running at the timeout.
+wait_for_change_set() {   # <id> <timeout seconds> <label>
+  local id="$1" timeout="$2" label="$3" waited=0 status
+  while :; do
+    status="$(aws marketplace-catalog describe-change-set --catalog AWSMarketplace \
+      --region "${AWS_REGION}" --change-set-id "${id}" --query Status --output text)"
+    case "${status}" in
+      PREPARING|APPLYING) ;;
+      *) break ;;
+    esac
+    if [[ "${waited}" -ge "${timeout}" ]]; then
+      echo "   ${label}: still ${status} after ${timeout}s" >&2
+      return 2
+    fi
+    sleep 15
+    waited=$(( waited + 15 ))
+    [[ $(( waited % 60 )) -eq 0 ]] && echo "   ${label}: ${status} (${waited}s)"
+  done
+  echo "   ${label}: ${status}"
+  if [[ "${status}" != "SUCCEEDED" ]]; then
+    echo "   errors:" >&2
+    aws marketplace-catalog describe-change-set --catalog AWSMarketplace \
+      --region "${AWS_REGION}" --change-set-id "${id}" \
+      --query 'ChangeSet[].ErrorDetailList' --output json >&2
+    return 1
+  fi
+  return 0
+}
+
+# One line in the CI job summary, so the outcome is visible without opening logs.
+summary() { [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] && echo "$*" >> "${GITHUB_STEP_SUMMARY}"; return 0; }
+
 if [[ "${MODE}" == "add" ]]; then
-  # Intent=VALIDATE runs AWS's own checks without creating the version. Always do
-  # it first in add mode - it costs a minute and catches the mistakes that
-  # otherwise surface as an asynchronous rejection against a version title that
-  # is now spent.
+  # Intent=VALIDATE runs AWS's own checks without creating the version, and
+  # nothing is applied until it comes back SUCCEEDED.
   echo ">> validating (Intent=VALIDATE)"
   VALIDATE_ID="$(submit VALIDATE)"
   echo "   validation change set: ${VALIDATE_ID}"
-  aws marketplace-catalog describe-change-set --catalog AWSMarketplace \
-    --region "${AWS_REGION}" --change-set-id "${VALIDATE_ID}" \
-    --query '{status:Status,errors:ChangeSet[].ErrorDetailList}' --output json
+  rc=0; wait_for_change_set "${VALIDATE_ID}" "${VALIDATE_TIMEOUT:-1800}" "validation" || rc=$?
+  if [[ "${rc}" -ne 0 ]]; then
+    summary "### Marketplace submission blocked — validation did not succeed (\`${VALIDATE_ID}\`)"
+    echo "FAIL: validation did not succeed. NOTHING WAS APPLIED, and no version" >&2
+    echo "      title was consumed. Fix the errors above and re-run." >&2
+    exit 1
+  fi
 
   if [[ "${VALIDATE_ONLY:-0}" == "1" ]]; then
-    echo ">> VALIDATE_ONLY=1 - validation submitted, no version created."
-    echo "   Validation is asynchronous; poll the change set above until it leaves PREPARING."
+    summary "### Marketplace validation SUCCEEDED (\`${VALIDATE_ID}\`) — no version created"
+    echo ">> VALIDATE_ONLY=1 — validation SUCCEEDED. No version created."
+    echo "   Re-run without VALIDATE_ONLY to submit this version for real."
     exit 0
   fi
 
-  echo ">> submitting (Intent=APPLY)"
+  echo ">> validation succeeded; submitting (Intent=APPLY)"
   ID="$(submit APPLY)"
 else
   if [[ "${VALIDATE_ONLY:-0}" == "1" ]]; then
@@ -384,17 +425,26 @@ NOVALIDATE
   ID="$(submit "")"
 fi
 
-cat <<EOF
-
->> submitted: ${ID}
-   Watch it with:
-     aws marketplace-catalog describe-change-set --catalog AWSMarketplace \\
-       --change-set-id ${ID} --region ${AWS_REGION} \\
-       --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'
-
-   Review takes minutes to hours.
-   ${MODE} mode: $( [[ "${MODE}" == "add" ]] \
-     && echo "a rejection consumes the version title \"${VERSION_TITLE}\" permanently - the next attempt needs a new AMI or an explicit VERSION_TITLE." \
-     || echo "no version title is consumed; a rejection can be corrected and resubmitted against the same version." )
-   See MARKETPLACE.md.
-EOF
+echo ">> submitted: ${ID} — waiting for it to finish"
+rc=0; wait_for_change_set "${ID}" "${APPLY_TIMEOUT:-3600}" "submission" || rc=$?
+case "${rc}" in
+  0) summary "### Marketplace ${MODE} SUCCEEDED — \`${VERSION_TITLE:-$ENTITY_IDENTIFIER}\` (\`${ID}\`)"
+     echo ">> DONE. The ${MODE} succeeded."
+     ;;
+  2) summary "### Marketplace ${MODE} still processing (\`${ID}\`)"
+     echo ">> Submitted and still processing after the wait. It is in AWS's hands now:"
+     echo "     aws marketplace-catalog describe-change-set --catalog AWSMarketplace \\"
+     echo "       --change-set-id ${ID} --region ${AWS_REGION} \\"
+     echo "       --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'"
+     ;;
+  *) summary "### Marketplace ${MODE} FAILED (\`${ID}\`)"
+     echo "FAIL: the ${MODE} did not succeed; errors above." >&2
+     if [[ "${MODE}" == "add" ]]; then
+       echo "      The version title \"${VERSION_TITLE}\" is now spent - the next" >&2
+       echo "      attempt needs a new AMI or an explicit VERSION_TITLE." >&2
+     else
+       echo "      No version title was consumed; correct and resubmit." >&2
+     fi
+     exit 1
+     ;;
+esac

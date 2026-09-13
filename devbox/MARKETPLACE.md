@@ -284,7 +284,17 @@ That asymmetry is survivable because the risk is asymmetric too: update consumes
 no version title, so a rejection can be corrected and resubmitted against the
 same version, while a rejected *add* spends its title permanently.
 
-**In add mode, always run `VALIDATE_ONLY=1` first.** It submits under `Intent=VALIDATE`, which
+**Validation gates the submission.** In add mode the script submits
+`Intent=VALIDATE`, waits for that change set to reach a terminal state, and only
+applies if it came back `SUCCEEDED`. A failed validation exits non-zero having
+applied nothing and consumed no version title. It then waits on the real
+submission too, so the job's exit status reflects what AWS actually did rather
+than what was accepted for processing. Tune with `VALIDATE_TIMEOUT` (default
+1800s) and `APPLY_TIMEOUT` (default 3600s); timing out is reported separately
+from failing, and does not fail the job, because the change set is submitted and
+in AWS's hands either way.
+
+`VALIDATE_ONLY=1` stops after a successful validation. It submits under `Intent=VALIDATE`, which
 runs the same server-side checks without creating a version. Version titles must
 be unique across the product's history and a *rejected* submission still consumes
 one, so a rehearsal costs a minute and saves a burned title. The script also
