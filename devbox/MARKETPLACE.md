@@ -203,9 +203,8 @@ scripts/submit-version.sh                   # validate, then submit for real
 
 Or from CI: run the **devbox AMI** workflow with `submit: true` (and
 `validate_only: true` for a rehearsal). That job sits behind the
-`marketplace-publish` environment, and works even when no new AMI was built —
-the common case is a template- or copy-only version against the AMI already in
-SSM.
+`marketplace-publish` environment. **`submit: true` forces an AMI build**, because
+a template change cannot ship any other way — see below.
 
 The devbox is an `AmiProduct@1.0` with a **CloudFormation delivery option**, so
 the details key is `DeploymentTemplateDeliveryOptionDetails` — not the

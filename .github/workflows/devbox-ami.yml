@@ -20,7 +20,7 @@ on:
         type: boolean
         default: false
       submit:
-        description: "Also submit the AMI to AWS Marketplace as a new version (irreversible; a rejection burns the version title)"
+        description: "Build a new AMI and submit it to AWS Marketplace as a new version (irreversible; a rejection burns the version title)"
         type: boolean
         default: false
       validate_only:
@@ -28,7 +28,7 @@ on:
         type: boolean
         default: false
       mode:
-        description: "With submit: auto picks add-vs-update from the listing (AWS forbids reusing an AMI across versions)"
+        description: "With submit: auto picks add-vs-update from the listing. Submitting builds a new AMI, so this resolves to add; update is for listing copy only"
         type: choice
         options: [auto, add, update]
         default: auto
@@ -68,7 +68,12 @@ jobs:
           echo "current:   $CURRENT"
           echo "published: $PUBLISHED"
           echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
-          if [ "${{ inputs.force }}" = "true" ] || [ "$CURRENT" != "$PUBLISHED" ]; then
+          # `submit` forces a build. A Marketplace version is (AMI + template +
+          # copy) reviewed as a unit: the template of a published version cannot
+          # be changed (UpdateDeliveryOptions rejects Template), and a new
+          # version cannot reuse an AMI. So shipping ANY template change needs a
+          # fresh AMI, even when the devbox image has not moved.
+          if [ "${{ inputs.force }}" = "true" ] || [ "${{ inputs.submit }}" = "true" ] || [ "$CURRENT" != "$PUBLISHED" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"
@@ -162,13 +167,12 @@ jobs:
   submit:
     name: submit version to AWS Marketplace
     needs: [check, build, publish]
-    # always() because the common case is a template- or listing-copy-only
-    # change: no new devbox image, so check says build=false and build/publish
-    # both skip. A skipped dependency is not a failed one, and submit-version.sh
-    # falls back to the AMI id in SSM when the build job produced none. It then
-    # resolves add-vs-update against the listing itself — that AMI is already on
-    # a version, so the only legal action is to update it in place.
-    if: always() && inputs.submit && needs.build.result != 'failure' && needs.publish.result != 'failure'
+    # Plain `needs` semantics: this runs only if the build, smoke test and SSM
+    # publish all succeeded. An earlier version used always() so it could submit
+    # a template-only change against the AMI already in SSM - that is not a thing
+    # AWS supports, so the special case is gone and with it the reason to bypass
+    # normal gating. Submitting always ships a freshly smoke-tested AMI.
+    if: inputs.submit
     runs-on: ubuntu-latest
     environment: marketplace-publish     # required reviewers live here
     steps:
@@ -186,8 +190,7 @@ jobs:
       - name: submit
         env:
           MARKETPLACE_PRODUCT_ID: ${{ vars.DEVBOX_MARKETPLACE_PRODUCT_ID }}
-          # Empty when build was skipped; submit-version.sh then reads the
-          # validated AMI id from SSM.
+          # Always set: the build job is forced whenever submit is true.
           AMI_ID: ${{ needs.build.outputs.ami }}
           VALIDATE_ONLY: ${{ inputs.validate_only && '1' || '0' }}
           MODE: ${{ inputs.mode }}

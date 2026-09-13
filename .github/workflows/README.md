@@ -6,7 +6,7 @@ Validation stays on Buildkite (`.buildkite/`) — these workflows are the
 
 | workflow | trigger | what it does |
 |---|---|---|
-| `devbox-ami.yml` | daily + manual | Rebuilds the devbox AMI when a new `flyte-devbox` image ships, smoke-tests it, and writes the id to SSM. With `submit: true`, also packages the listing template and submits a Marketplace version. |
+| `devbox-ami.yml` | daily + manual | Rebuilds the devbox AMI when a new `flyte-devbox` image ships, smoke-tests it, and writes the id to SSM. With `submit: true`, forces a build and submits the result to AWS Marketplace as a new version. |
 | `eks-addon.yml` | daily + manual | Bumps to a new upstream `flyte-binary` chart, validates, pushes the chart and images to the Marketplace ECR, and opens a PR. Submitting the version is a separate, manual job. |
 
 ## Setup
@@ -66,11 +66,18 @@ fire automatically, drop the `if: inputs.submit` on the `submit` job — the
 
 `devbox-ami.yml` splits the same way and for a similar reason: publishing an AMI
 id to SSM is reversible (the next build overwrites it), but a Marketplace version
-is not — a rejection permanently consumes the version title. Its `submit` job
-also runs when no AMI was built, because a template- or listing-copy-only version
-against the AMI already in SSM is the common case. Both products support
-`validate_only`, which submits under `Intent=VALIDATE` and creates nothing; use
-it as a rehearsal before spending a version title.
+is not — a rejection permanently consumes the version title.
+
+**`submit: true` forces an AMI build.** A Marketplace version is (AMI + template +
+copy) reviewed as a unit: the template of a published version cannot be changed,
+and a new version cannot reuse an AMI. So shipping any template change needs a
+fresh AMI even when the devbox image has not moved, and there is no such thing as
+a template-only version. The `submit` job therefore uses ordinary `needs`
+gating — build, smoke and publish must all have succeeded — rather than the
+`always()` bypass an earlier version needed.
+
+Both products support `validate_only`, which submits under `Intent=VALIDATE` and
+creates nothing; use it as a rehearsal before spending a version title.
 
 ## Why two roles
 
