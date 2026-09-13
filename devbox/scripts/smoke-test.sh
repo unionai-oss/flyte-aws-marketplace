@@ -32,6 +32,19 @@ aws_() { aws "${AWSP[@]}" --region "$REGION" "$@"; }
 
 log() { printf '\n\033[36m▶ %s\033[0m\n' "$*"; }
 
+# Preconditions BEFORE spending any AWS money. This test deploys a full stack and
+# waits ~5 minutes for a cold boot before it first needs the flyte CLI; without
+# this check a missing binary costs a 30-minute round trip and a torn-down stack
+# to discover. That is exactly how it failed the first time it ran on a GitHub
+# runner, where nothing installs the CLI (Buildkite pip-installed it).
+FLYTE="${FLYTE_BIN:-flyte}"
+for tool in aws python3 "$FLYTE"; do
+  command -v "$tool" >/dev/null || {
+    echo "FAIL: '$tool' is not on PATH; not deploying anything." >&2
+    [ "$tool" = "$FLYTE" ] && echo "      Install it with: python3 -m pip install --upgrade flyte" >&2
+    exit 1; }
+done
+
 teardown() {
   if [ "${KEEP:-0}" = "1" ]; then
     log "KEEP=1 — leaving $STACK_NAME up for inspection (delete it manually when done)"; return
@@ -131,7 +144,6 @@ task:
   domain: development
 YAML
 
-FLYTE="${FLYTE_BIN:-flyte}"
 # On a brand-new box the data-proxy/storage subsystem can lag a little behind the
 # API answering ListProjects, so give it a warm-up buffer + retry the run.
 log "Warming up before run..."

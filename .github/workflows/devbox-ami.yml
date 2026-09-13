@@ -135,6 +135,16 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_SMOKE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+      # The test runs a real workflow against the deployed devbox, so it needs
+      # the flyte CLI. Buildkite pip-installed it; the port to GitHub Actions
+      # dropped that, and the gap only surfaced once a run got far enough to
+      # reach the smoke step. setup-python rather than the system interpreter:
+      # Ubuntu's is PEP 668 externally-managed and refuses a plain pip install.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: install the flyte CLI
+        run: python3 -m pip install --quiet --upgrade flyte
       - run: AMI_ID="${{ needs.build.outputs.ami }}" ./devbox/scripts/smoke-test.sh
 
   publish:
