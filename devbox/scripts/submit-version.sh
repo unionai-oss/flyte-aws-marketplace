@@ -353,7 +353,10 @@ else
    Update is the cheap direction: it consumes no version title, so a rejection
    can be corrected and resubmitted against the same version.
 NOVALIDATE
-    exit 0
+    # Non-zero on purpose. The caller asked for a rehearsal that cannot be
+    # performed, so nothing was submitted - and exiting 0 here made a CI run go
+    # green having deliberately done nothing, which read as "submitted".
+    exit 2
   fi
 
   echo ">> submitting (no Intent - not supported for UpdateDeliveryOptions)"
