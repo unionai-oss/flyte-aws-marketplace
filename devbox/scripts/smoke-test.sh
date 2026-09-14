@@ -129,7 +129,27 @@ aws_ cloudformation create-change-set --stack-name "$STACK_NAME" --change-set-na
     ParameterKey=AmiId,ParameterValue="${AMI_ID:-}" >/dev/null
 aws_ cloudformation wait change-set-create-complete --stack-name "$STACK_NAME" --change-set-name smoke
 aws_ cloudformation execute-change-set --stack-name "$STACK_NAME" --change-set-name smoke
-aws_ cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
+# On a rollback the waiter says only "matched expected path ROLLBACK_COMPLETE",
+# which names the symptom and not one failing resource. Print the actual reasons
+# before the EXIT trap deletes the stack and takes its events with it.
+if ! aws_ cloudformation wait stack-create-complete --stack-name "$STACK_NAME"; then
+  log "❌ STACK FAILED — first failing resources:"
+  aws_ cloudformation describe-stack-events --stack-name "$STACK_NAME" \
+    --query "reverse(StackEvents[?ResourceStatus=='CREATE_FAILED'].{Resource:LogicalResourceId,Type:ResourceType,Reason:ResourceStatusReason})" \
+    --output table 2>/dev/null | head -40 || true
+  # Nested stacks report only "Embedded stack ... was not successfully created",
+  # so walk into any that failed and print their reasons too.
+  for nested in $(aws_ cloudformation describe-stack-resources --stack-name "$STACK_NAME" \
+      --query "StackResources[?ResourceType=='AWS::CloudFormation::Stack'].PhysicalResourceId" \
+      --output text 2>/dev/null); do
+    [ -n "$nested" ] || continue
+    log "  nested: $nested"
+    aws_ cloudformation describe-stack-events --stack-name "$nested" \
+      --query "reverse(StackEvents[?ResourceStatus=='CREATE_FAILED'].{Resource:LogicalResourceId,Type:ResourceType,Reason:ResourceStatusReason})" \
+      --output table 2>/dev/null | head -30 || true
+  done
+  exit 1
+fi
 
 ENDPOINT="dns:///${DOMAIN}:443"
 POOL=$(aws_ cloudformation describe-stacks --stack-name "$STACK_NAME" --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue" --output text)
