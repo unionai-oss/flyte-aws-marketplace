@@ -67,6 +67,36 @@ PYEOF
   [ "$comp_ok" = 1 ] && ok "python sources compile" || bad "python compile errors"
 else skip "python3 not found"; fi
 
+section "hosted-UI logo (embedded base64 decodes, within Cognito's cap)"
+"$PY" - "$ROOT/../common/cloudformation/auth.yaml" <<'LOGOEOF' \
+  && ok "login logo embeds cleanly" || bad "login logo problem"
+import ast, base64, struct, sys
+raw = open(sys.argv[1]).read().split('\n')
+body = None
+for i, l in enumerate(raw):
+    if l.strip() == 'ZipFile: |':
+        base = len(raw[i+1]) - len(raw[i+1].lstrip()); out = []
+        for x in raw[i+1:]:
+            if x.strip() == '': out.append(''); continue
+            if (len(x) - len(x.lstrip())) < base: break
+            out.append(x[base:])
+        body = '\n'.join(out); break
+if body is None: sys.exit('no inline ZipFile in auth.yaml')
+ast.parse(body)
+ns = {}
+exec(compile(body.split('def handler')[0].replace('import base64, cfnresponse, boto3', 'import base64'),
+             '<logo>', 'exec'), ns)
+b64 = ns.get('LOGO_B64')
+if not b64: sys.exit('LOGO_B64 not found in the branding lambda')
+png = base64.b64decode(b64)
+if png[:8] != b'\x89PNG\r\n\x1a\n': sys.exit('LOGO_B64 does not decode to a PNG')
+w, h = struct.unpack('>II', png[16:24])
+# Cognito: <=100 KB raw / 131072 bytes base64, rendered at 350x178.
+if len(b64) > 131072: sys.exit('base64 logo is %d bytes, over Cognito 131072 cap' % len(b64))
+if len(png) > 100 * 1024: sys.exit('logo PNG is %d bytes, over Cognito 100 KB cap' % len(png))
+print('   %dx%d PNG, %d KB raw / %d KB base64 (cap 128 KB)' % (w, h, len(png)//1024, len(b64)//1024))
+LOGOEOF
+
 section "traefik access-log manifest (YAML parses)"
 if [ -n "$PY" ]; then
   "$PY" -c "import sys,yaml; list(yaml.safe_load_all(open(sys.argv[1])))" "$PFILES/traefik-accesslog.yaml" 2>/dev/null \

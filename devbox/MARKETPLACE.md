@@ -150,10 +150,18 @@ cost a rejected submission:
 - **No seller-hosted Lambda code.** Marketplace neither ingests nor scans objects
   in a seller bucket, so `Code:` pointing at a directory (which
   `cloudformation package` zips and uploads) counts as an external dependency.
-  Every Lambda here is inline `ZipFile`. This is why the Cognito hosted-UI logo
-  is gone: only the `SetUICustomization` API can set a logo, which needed a
-  Lambda plus a 25 KB PNG, so `common/cloudformation/auth.yaml` uses the native
-  CSS-only `UserPoolUICustomizationAttachment` instead.
+  Every Lambda here is inline `ZipFile`.
+
+  This once cost us the Cognito hosted-UI logo, on the assumption that the PNG
+  had to sit beside the Lambda in a bucket. It does not: base64 the image into
+  the inline `ZipFile` and it is just source code in the template, ingested and
+  scanned like any other. `ZipFile` allows 4 MB and Cognito allows 128 KB of
+  base64, against a ~22 KB logo, so there is room to spare.
+  `common/cloudformation/auth.yaml` now sets the logo *and* the CSS from one
+  inline Lambda — one writer, because `SetUICustomization` replaces the whole
+  customization and a `UserPoolUICustomizationAttachment` alongside it would
+  wipe the image. `scripts/validate.sh` checks the blob still decodes to a PNG
+  within Cognito's cap.
 - **Nested templates must be publicly readable** and referenced via `MPS3*` (see
   above). Check with an unauthenticated `curl` after uploading.
 - The AMI comes from a template parameter (`AmiId`), never a hardcoded id or a
