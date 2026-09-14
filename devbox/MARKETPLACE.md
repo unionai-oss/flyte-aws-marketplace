@@ -310,6 +310,28 @@ refuses to submit the `flyte-devbox-latest.yaml` alias, checks for an in-flight
 change set, and verifies the AMI is owned by this account in us-east-1 (the only
 region the Catalog API ingests from).
 
+## 3d. The listing logo
+
+The tile logo is product **metadata**, not part of a version, so it changes via
+the `UpdateInformation` change type - no new AMI, no version title consumed, and
+a logo-only update is explicitly allowed.
+
+```bash
+scripts/package-marketplace.sh      # uploads listing/logo.png to the public bucket
+scripts/set-listing-logo.sh         # UpdateInformation with the resulting LogoUrl
+```
+
+Deliberately separate from `submit-version.sh`: Marketplace processes one change
+set at a time per product, so bundling a metadata change with a version
+submission would let each block the other.
+
+`listing/logo.png` is the on-light lockup at 640x322. AWS wants **120-640px** at
+**1:1 to 2:1**, with a transparent or white background - and renders it on a
+white card, which is why the white-wordmark variant of the brand asset is the
+wrong one here. `LogoUrl` must be publicly readable; the script checks with an
+unauthenticated GET before submitting, and validates the URL against the pattern
+AWS enforces.
+
 ## 5. Listing (Marketplace Management Portal)
 
 - [ ] Product title, short/long description, categories

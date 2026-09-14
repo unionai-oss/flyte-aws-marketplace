@@ -217,7 +217,7 @@ aws s3 cp "${WORK}/root.yaml" "s3://${BUCKET}/devbox/flyte-devbox-${VERSION}.yam
 aws s3 cp "${WORK}/root.yaml" "s3://${BUCKET}/devbox/flyte-devbox-latest.yaml" \
   --region "${REGION}" >/dev/null
 
-echo ">> [4/4] upload the architecture diagram"
+echo ">> [4/4] upload the architecture diagram + listing logo"
 if [[ -f "${REPO_ROOT}/docs/architecture.png" ]]; then
   aws s3 cp "${REPO_ROOT}/docs/architecture.png" "s3://${BUCKET}/devbox/architecture.png" \
     --region "${REGION}" >/dev/null
@@ -226,12 +226,24 @@ else
   echo "   SKIP: devbox/docs/architecture.png not found"
 fi
 
+# The listing tile logo. Metadata rather than part of a version, so it ships via
+# scripts/set-listing-logo.sh (UpdateInformation) rather than with a template -
+# but it is uploaded here because this is where the public bucket already is.
+if [[ -f "${REPO_ROOT}/listing/logo.png" ]]; then
+  aws s3 cp "${REPO_ROOT}/listing/logo.png" "s3://${BUCKET}/devbox/logo.png" \
+    --region "${REGION}" >/dev/null
+  echo "   uploaded logo.png"
+else
+  echo "   SKIP: devbox/listing/logo.png not found"
+fi
+
 BASE="https://${BUCKET}.s3.${REGION}.amazonaws.com"
 MANIFEST="${REPO_ROOT}/.package-manifest.json"
 cat > "${MANIFEST}" <<EOF
 {
   "template_url": "${BASE}/devbox/flyte-devbox-${VERSION}.yaml",
   "diagram_url": "${BASE}/devbox/architecture.png",
+  "logo_url": "${BASE}/devbox/logo.png",
   "version": "${VERSION}"
 }
 EOF
@@ -245,6 +257,7 @@ cat <<EOF
    Architecture diagram    : ${BASE}/devbox/architecture.png
 
    Submit with:  scripts/submit-version.sh
+   Listing logo: scripts/set-listing-logo.sh   (metadata only; no new version)
    It reads .package-manifest.json, so it submits the VERSIONED url above
    rather than the alias — a listing should not change underneath a version
    AWS has already reviewed.
