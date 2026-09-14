@@ -157,6 +157,19 @@ aws iam put-role-policy --role-name github-actions-flyte-marketplace \
 ensure_role github-actions-flyte-devbox-smoke "${WORK}/trust-smoke.json" \
   "GitHub Actions OIDC: devbox smoke test (full stack deploy + teardown)"
 
+# The smoke job outlives a default session. Deploying the stack is ~14 minutes,
+# and the pre-clean waits for any previous stack to finish deleting first - which
+# it must, or the CREATE collides on retained names. One run took 60.5 minutes
+# and its credentials expired mid-wait:
+#
+#   Waiter StackCreateComplete failed: (ExpiredToken) The security token
+#   included in the request is expired
+#
+# A role cannot be assumed for longer than its MaxSessionDuration, so raising
+# role-duration-seconds in the workflow is not enough on its own.
+aws iam update-role --role-name github-actions-flyte-devbox-smoke \
+  --max-session-duration 14400
+
 aws iam attach-role-policy --role-name github-actions-flyte-devbox-smoke \
   --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
 

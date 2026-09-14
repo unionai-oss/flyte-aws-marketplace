@@ -97,6 +97,41 @@ if len(png) > 100 * 1024: sys.exit('logo PNG is %d bytes, over Cognito 100 KB ca
 print('   %dx%d PNG, %d KB raw / %d KB base64 (cap 128 KB)' % (w, h, len(png)//1024, len(b64)//1024))
 LOGOEOF
 
+section "custom-resource lambdas can actually respond"
+"$PY" - "$ROOT/../common/cloudformation/auth.yaml" "$TEMPLATE" <<'CFNEOF' \
+  && ok "custom resources can respond" || bad "a custom resource may strand a stack"
+import sys
+# CloudFormation injects the cfnresponse module ONLY when the source contains the
+# exact substring "import cfnresponse". "import base64, cfnresponse, boto3" does
+# not, so the module is missing, every invocation dies with ImportModuleError,
+# and a Delete that never answers leaves the stack DELETE_FAILED - which for a
+# buyer means a stack they cannot remove. Cheap to check, expensive to discover.
+bad = []
+for path in sys.argv[1:]:
+    raw = open(path).read().split('\n')
+    n = 0
+    for i, l in enumerate(raw):
+        if l.strip() != 'ZipFile: |':
+            continue
+        n += 1
+        base = len(raw[i+1]) - len(raw[i+1].lstrip()); body = []
+        for x in raw[i+1:]:
+            if x.strip() == '': body.append(''); continue
+            if (len(x) - len(x.lstrip())) < base: break
+            body.append(x[base:])
+        src = '\n'.join(body)
+        if 'cfnresponse' in src and 'import cfnresponse' not in src:
+            bad.append('%s lambda#%d imports cfnresponse in a form CloudFormation will not inject' % (path, n))
+        # A custom resource that only responds inside a try: can fail before it
+        # ever answers. Require Delete to be handled before anything that throws.
+        if 'ResponseURL' in src or 'cfnresponse' in src:
+            if "RequestType" not in src:
+                bad.append('%s lambda#%d never inspects RequestType' % (path, n))
+for b in bad:
+    print('   ' + b)
+sys.exit(1 if bad else 0)
+CFNEOF
+
 section "traefik access-log manifest (YAML parses)"
 if [ -n "$PY" ]; then
   "$PY" -c "import sys,yaml; list(yaml.safe_load_all(open(sys.argv[1])))" "$PFILES/traefik-accesslog.yaml" 2>/dev/null \

@@ -188,7 +188,39 @@ Resources:
       Role: !GetAtt LoginBrandingRole.Arn
       Code:
         ZipFile: |
-          import base64, cfnresponse, boto3
+          import base64
+          import json
+          import urllib.request
+          import boto3
+
+          # Responding by hand rather than importing cfnresponse.
+          #
+          # CloudFormation injects that module only when the source contains the
+          # exact substring "import cfnresponse". This function originally read
+          # "import base64, cfnresponse, boto3", which does not - so the module
+          # was absent, every invocation died with Runtime.ImportModuleError, and
+          # the Delete never answered. CloudFormation waited, then gave up:
+          #
+          #   CloudFormation did not receive a response from your Custom Resource
+          #
+          # leaving the stack DELETE_FAILED. A custom resource that cannot answer
+          # can strand a buyer's stack, so this depends on no such behaviour: the
+          # response is ~15 lines of urllib and the only import that matters is
+          # from the standard library.
+          def send(event, context, status, reason=""):
+            body = json.dumps({
+              "Status": status,
+              "Reason": reason or ("see CloudWatch log stream " + context.log_stream_name),
+              "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+              "StackId": event["StackId"],
+              "RequestId": event["RequestId"],
+              "LogicalResourceId": event["LogicalResourceId"],
+              "Data": {},
+            }).encode()
+            req = urllib.request.Request(
+              event["ResponseURL"], data=body, method="PUT",
+              headers={"content-type": "", "content-length": str(len(body))})
+            urllib.request.urlopen(req, timeout=20)
 
           # flyte_byUnion_stacked_onLight.png, scaled to the 350x178 that Cognito
           # renders the hosted-UI logo at. The light-background lockup on purpose:
@@ -432,20 +464,24 @@ Resources:
           )
 
           def handler(event, context):
+            # Delete must ALWAYS answer, before anything that could raise. Failing
+            # to respond here is what strands a stack in DELETE_FAILED, and there
+            # is nothing to undo anyway - the user pool goes with the stack.
+            if event.get("RequestType") == "Delete":
+              try:
+                send(event, context, "SUCCESS")
+              except Exception as e:
+                print("delete response failed: %s" % e)
+              return
             try:
-              c = boto3.client('cognito-idp')
-              pool = event['ResourceProperties']['UserPoolId']
-              if event['RequestType'] == 'Delete':
-                # The pool is going away with the stack; nothing to undo, and
-                # failing here would only strand a DELETE.
-                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}); return
-              c.set_ui_customization(
-                UserPoolId=pool, ClientId='ALL',
+              boto3.client('cognito-idp').set_ui_customization(
+                UserPoolId=event['ResourceProperties']['UserPoolId'], ClientId='ALL',
                 CSS=event['ResourceProperties']['CSS'],
                 ImageFile=base64.b64decode(LOGO_B64))
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              send(event, context, "SUCCESS")
             except Exception as e:
-              cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e)[:200])
+              print("branding failed: %s" % e)
+              send(event, context, "FAILED", str(e)[:200])
 
   LoginBranding:
     Type: Custom::LoginBranding

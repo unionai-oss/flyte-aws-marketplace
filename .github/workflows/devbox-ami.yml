@@ -135,6 +135,11 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_SMOKE_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          # The default hour is not enough: deploy is ~14 minutes and the
+          # pre-clean first waits out any still-deleting previous stack. A
+          # 60.5-minute run expired its token mid-wait. Needs the role's
+          # MaxSessionDuration raised to match (seller-account-setup.sh).
+          role-duration-seconds: 14400
       # The test runs a real workflow against the deployed devbox, so it needs
       # the flyte CLI. Buildkite pip-installed it; the port to GitHub Actions
       # dropped that, and the gap only surfaced once a run got far enough to
