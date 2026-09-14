@@ -45,6 +45,36 @@ for tool in aws python3 "$FLYTE"; do
     exit 1; }
 done
 
+# Remove the stack's data bucket, versions and all.
+#
+# `aws s3 rb --force` deletes only CURRENT objects. The bucket has versioning
+# enabled, so noncurrent versions and delete markers survive, rb then fails on a
+# bucket it considers non-empty - and both call sites swallowed that with
+# `|| true`. The bucket is DeletionPolicy: Retain, so it outlived the stack and
+# collided with the next run:
+#
+#   NAME_CONFLICT_VALIDATION: Resource of type 'AWS::S3::Bucket' with identifier
+#   'flyte-devbox-smoke-flyte-...' already exists
+#
+# It only started biting once the smoke test grew the app step, which overwrites
+# and deletes objects and so actually produces versions to leave behind.
+empty_and_remove_bucket() {   # <bucket>
+  local b="$1" batch n
+  aws_ s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 0
+  while :; do
+    batch="$(aws_ s3api list-object-versions --bucket "$b" --max-keys 500 \
+      --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+      --output json 2>/dev/null || echo '{"Objects":[]}')"
+    n="$(printf '%s' "$batch" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("Objects") or []))' 2>/dev/null || echo 0)"
+    [ "${n:-0}" -gt 0 ] || break
+    aws_ s3api delete-objects --bucket "$b" --delete "$batch" >/dev/null 2>&1 || break
+    echo "  removed $n object versions from $b"
+  done
+  aws_ s3api delete-bucket --bucket "$b" >/dev/null 2>&1 \
+    && echo "  deleted bucket $b" \
+    || echo "  WARNING: could not delete bucket $b — the next run will collide" >&2
+}
+
 # Snapshots left behind by the Aurora cluster's DeletionPolicy: Snapshot. A
 # deletion policy cannot be conditional, so every teardown of this throwaway
 # stack takes a final snapshot of a database nobody will ever read - and they
@@ -65,7 +95,7 @@ teardown() {
   log "Teardown: deleting $STACK_NAME"
   BUCKET=$(aws_ cloudformation describe-stacks --stack-name "$STACK_NAME" \
     --query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text 2>/dev/null || true)
-  [ -n "${BUCKET:-}" ] && [ "$BUCKET" != "None" ] && aws_ s3 rb "s3://$BUCKET" --force >/dev/null 2>&1 || true
+  [ -n "${BUCKET:-}" ] && [ "$BUCKET" != "None" ] && empty_and_remove_bucket "$BUCKET"
   aws_ cloudformation delete-stack --stack-name "$STACK_NAME" >/dev/null 2>&1 || true
 
   # Deleting this stack takes ~15 minutes, almost all of it Aurora, and it gates
@@ -111,7 +141,7 @@ for r in $(aws_ ecr describe-repositories --query "repositories[?starts_with(rep
   aws_ ecr delete-repository --repository-name "$r" --force >/dev/null 2>&1 || true
 done
 aws_ backup delete-backup-vault --backup-vault-name "${STACK_NAME}-flyte-data" >/dev/null 2>&1 || true
-aws_ s3 rb "s3://${STACK_NAME}-flyte-${ACCOUNT}-${REGION}" --force >/dev/null 2>&1 || true
+empty_and_remove_bucket "${STACK_NAME}-flyte-${ACCOUNT}-${REGION}"
 delete_smoke_db_snapshots
 # Package the nested templates to S3, then create-change-set + execute (more
 # robust than `cloudformation deploy`, whose early-validation hook is flaky).
