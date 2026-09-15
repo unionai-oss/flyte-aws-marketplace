@@ -103,15 +103,27 @@ jobs:
           # instance type though — us-east-1e has no m6i, and picking Subnets[0]
           # blindly lands there and fails RunInstances with `Unsupported` — so
           # restrict the choice to AZs that actually offer it.
+          #
+          # Scoped to the DEFAULT VPC, which is not fussiness. The smoke test
+          # stands up its own VPC whose public subnets also carry
+          # map-public-ip-on-launch=true, so an account-wide search could pick
+          # one of those - and did. Two builds failed with "Timeout waiting for
+          # SSH" because the instance was launched into a smoke stack's VPC that
+          # was being deleted around it; by the time anyone looked, the subnet
+          # and VPC no longer existed. Non-blocking teardown makes a smoke VPC
+          # far more likely to still be there when the next build starts.
+          VPC=$(aws ec2 describe-vpcs --filters Name=isDefault,Values=true \
+                  --query 'Vpcs[0].VpcId' --output text)
+          [ "$VPC" != "None" ] && [ -n "$VPC" ] || { echo "no default VPC in this account/region" >&2; exit 1; }
           TYPE=$(grep -A2 'variable "instance_type"' flyte-devbox.pkr.hcl | sed -n 's/.*default *= *"\(.*\)"/\1/p')
           AZS=$(aws ec2 describe-instance-type-offerings --location-type availability-zone \
                   --filters Name=instance-type,Values="$TYPE" \
                   --query 'InstanceTypeOfferings[].Location' --output text | tr '\t' ',')
           SUBNET=$(aws ec2 describe-subnets \
-                     --filters Name=map-public-ip-on-launch,Values=true "Name=availability-zone,Values=$AZS" \
+                     --filters Name=vpc-id,Values="$VPC" Name=map-public-ip-on-launch,Values=true \
+                               "Name=availability-zone,Values=$AZS" \
                      --query 'Subnets[0].SubnetId' --output text)
-          [ "$SUBNET" != "None" ] || { echo "no public subnet in an AZ offering $TYPE" >&2; exit 1; }
-          VPC=$(aws ec2 describe-subnets --subnet-ids "$SUBNET" --query 'Subnets[0].VpcId' --output text)
+          [ "$SUBNET" != "None" ] && [ -n "$SUBNET" ] || { echo "no public subnet in the default VPC in an AZ offering $TYPE" >&2; exit 1; }
           echo "building in $VPC / $SUBNET"
           packer build -var subnet_id="$SUBNET" -var vpc_id="$VPC" \
             -var devbox_image="$DEVBOX_IMAGE" -machine-readable . | tee /tmp/packer.log
