@@ -44,9 +44,15 @@ variable "vpc_id" {
 
 # Canonical Ubuntu 24.04 (noble), gp3, amd64 — matches the CFN template's AMI.
 source "amazon-ebs" "flyte" {
-  region                      = var.region
-  instance_type               = var.instance_type
-  ssh_username                = "ubuntu"
+  region        = var.region
+  instance_type = var.instance_type
+  ssh_username  = "ubuntu"
+  # Packer's default SSH wait is 5 minutes, and one unattended build lost the
+  # whole run to "Timeout waiting for SSH" after 5m50s - the instance launched
+  # fine, it just was not reachable yet. Nothing downstream cares whether the
+  # build took four minutes or twelve, so wait longer rather than fail a run
+  # that had another hour of work queued behind it.
+  ssh_timeout                 = "12m"
   vpc_id                      = var.vpc_id
   subnet_id                   = var.subnet_id
   associate_public_ip_address = true
