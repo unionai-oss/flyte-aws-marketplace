@@ -133,6 +133,13 @@ ensure_role github-actions-flyte-marketplace "${WORK}/trust.json" \
 aws iam attach-role-policy --role-name github-actions-flyte-marketplace \
   --policy-arn arn:aws:iam::aws:policy/AmazonEC2FullAccess
 
+# Submitting outlives a default session too. Marketplace validation alone ran
+# 27 minutes on one version, and the submit job waits for it and then for the
+# apply. A role cannot be assumed for longer than its MaxSessionDuration, so
+# role-duration-seconds in the workflow is not enough on its own.
+aws iam update-role --role-name github-actions-flyte-marketplace \
+  --max-session-duration 14400
+
 aws iam put-role-policy --role-name github-actions-flyte-marketplace \
   --policy-name flyte-marketplace-publish \
   --policy-document "file://${WORK}/perms.json"

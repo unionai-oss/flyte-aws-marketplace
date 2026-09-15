@@ -14,12 +14,23 @@
 # APPLY, which made the rehearsal decoration - the result arrived long after the
 # version had been created. Now validation actually gates the submission.
 #
-# Returns 0 SUCCEEDED, 1 FAILED/CANCELLED, 2 still running at the timeout.
+# Returns 0 SUCCEEDED, 1 FAILED/CANCELLED, 2 still running at the timeout,
+# 3 we lost the ability to look.
+#
+# 3 exists because conflating it with 1 told a real lie. When the polling
+# credentials expired mid-wait, the describe call failed, status came back empty,
+# and "not SUCCEEDED" was reported as "the submission failed - your version title
+# is spent". The submission had in fact been accepted and was still processing.
+# Not knowing is its own outcome and has to be said as one.
 wait_for_change_set() {   # <id> <timeout seconds> <label>
   local id="$1" timeout="$2" label="$3" waited=0 status
   while :; do
     status="$(aws marketplace-catalog describe-change-set --catalog AWSMarketplace \
-      --region "${AWS_REGION}" --change-set-id "${id}" --query Status --output text)"
+      --region "${AWS_REGION}" --change-set-id "${id}" --query Status --output text 2>/dev/null)" || status=""
+    if [[ -z "${status}" || "${status}" == "None" ]]; then
+      echo "   ${label}: cannot read the change set (expired credentials, or throttling)" >&2
+      return 3
+    fi
     case "${status}" in
       PREPARING|APPLYING) ;;
       *) break ;;

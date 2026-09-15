@@ -196,6 +196,13 @@ jobs:
         with:
           role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          # Marketplace validation alone took 27 minutes on one version, and the
+          # job waits for that and then for the apply. The default hour expired
+          # mid-poll, after the version had already been submitted - so the job
+          # failed while the submission carried on server-side, which is the
+          # worst of both. Needs the role's MaxSessionDuration raised to match
+          # (seller-account-setup.sh).
+          role-duration-seconds: 14400
 
       # Uploads the buyer-facing template variant and the architecture diagram,
       # and writes devbox/.package-manifest.json with the VERSIONED urls.

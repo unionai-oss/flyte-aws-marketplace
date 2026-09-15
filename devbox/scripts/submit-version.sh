@@ -339,7 +339,13 @@ if [[ "${MODE}" == "add" ]]; then
   echo ">> validating (Intent=VALIDATE)"
   VALIDATE_ID="$(submit VALIDATE)"
   echo "   validation change set: ${VALIDATE_ID}"
-  rc=0; wait_for_change_set "${VALIDATE_ID}" "${VALIDATE_TIMEOUT:-1800}" "validation" || rc=$?
+  rc=0; wait_for_change_set "${VALIDATE_ID}" "${VALIDATE_TIMEOUT:-3600}" "validation" || rc=$?
+  if [[ "${rc}" -eq 3 ]]; then
+    summary "### Marketplace validation unreadable (\`${VALIDATE_ID}\`) — nothing applied"
+    echo "FAIL: could not read the validation result, so nothing was applied." >&2
+    echo "      No version title was consumed; re-run once credentials are sound." >&2
+    exit 1
+  fi
   if [[ "${rc}" -ne 0 ]]; then
     summary "### Marketplace submission blocked — validation did not succeed (\`${VALIDATE_ID}\`)"
     echo "FAIL: validation did not succeed. NOTHING WAS APPLIED, and no version" >&2
@@ -385,6 +391,15 @@ rc=0; wait_for_change_set "${ID}" "${APPLY_TIMEOUT:-3600}" "submission" || rc=$?
 case "${rc}" in
   0) summary "### Marketplace ${MODE} SUCCEEDED — \`${VERSION_TITLE:-$ENTITY_IDENTIFIER}\` (\`${ID}\`)"
      echo ">> DONE. The ${MODE} succeeded."
+     ;;
+  3) summary "### Marketplace ${MODE} SUBMITTED, outcome unknown (\`${ID}\`)"
+     echo ">> SUBMITTED as ${ID}, but this job lost the ability to watch it." >&2
+     echo "   The change set was accepted and is processing. Do NOT assume it failed," >&2
+     echo "   and do NOT resubmit until you have checked it:" >&2
+     echo "     aws marketplace-catalog describe-change-set --catalog AWSMarketplace \\" >&2
+     echo "       --change-set-id ${ID} --region ${AWS_REGION} \\" >&2
+     echo "       --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'" >&2
+     exit 1
      ;;
   2) summary "### Marketplace ${MODE} still processing (\`${ID}\`)"
      echo ">> Submitted and still processing after the wait. It is in AWS's hands now:"
