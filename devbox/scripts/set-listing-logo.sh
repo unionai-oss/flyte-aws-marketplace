@@ -72,10 +72,12 @@ if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
+CHANGE_SET_FILE="$(mktemp -t logo-change-set-XXXX.json)"
+printf '%s' "${CHANGE_SET}" > "${CHANGE_SET_FILE}"
 ID="$(aws marketplace-catalog start-change-set --catalog AWSMarketplace \
   --region "${AWS_REGION}" \
   --change-set-name "flyte-devbox-logo-$(date +%Y%m%d%H%M%S)" \
-  --change-set "${CHANGE_SET}" \
+  --change-set "file://${CHANGE_SET_FILE}" \
   --query ChangeSetId --output text)"
 
 echo ">> submitted: ${ID} — waiting"

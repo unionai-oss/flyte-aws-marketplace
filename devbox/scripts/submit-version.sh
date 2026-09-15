@@ -110,8 +110,13 @@ fi
 # silently producing a change set aimed at the wrong thing.
 if [[ "${MODE}" != "add" ]]; then
   echo ">> describing ${MARKETPLACE_PRODUCT_ID}"
-  ENTITY_JSON="$(aws marketplace-catalog describe-entity --catalog AWSMarketplace \
-    --region "${AWS_REGION}" --entity-id "${MARKETPLACE_PRODUCT_ID}" --output json)"
+  # To a file, never an argument. The response is already 138 KB with three
+  # versions published and Linux refuses a single argv entry over 128 KB:
+  #   /usr/bin/python3: Argument list too long
+  ENTITY_JSON="$(mktemp -t entity-XXXX.json)"
+  trap 'rm -f "${ENTITY_JSON}"' EXIT
+  aws marketplace-catalog describe-entity --catalog AWSMarketplace \
+    --region "${AWS_REGION}" --entity-id "${MARKETPLACE_PRODUCT_ID}" --output json > "${ENTITY_JSON}"
 
   DISCOVERED="$(python3 "${REPO_ROOT}/scripts/describe-entity.py" "${ENTITY_JSON}" "${AMI_ID:-}")"
   echo "${DISCOVERED}" | python3 -m json.tool
@@ -285,6 +290,9 @@ CHANGE_SET="$(python3 "${GEN}" "${LISTING}" "${MARKETPLACE_PRODUCT_ID}" "${VERSI
                 "${RECOMMENDED_INSTANCE_TYPE}" "${AMI_TEMPLATE_PARAMETER}" \
                 "${MODE}" "${ENTITY_IDENTIFIER:-}" "${DELIVERY_OPTION_ID:-}")"
 
+CHANGE_SET_FILE="$(mktemp -t change-set-XXXX.json)"
+printf '%s' "${CHANGE_SET}" > "${CHANGE_SET_FILE}"
+
 echo ">> ${MODE} change set for ${MARKETPLACE_PRODUCT_ID}"
 if [[ "${MODE}" == "add" ]]; then
   echo "   version:  ${VERSION_TITLE}"
@@ -324,7 +332,7 @@ submit() {  # $1 = Intent, or "" for none
   aws marketplace-catalog start-change-set --catalog AWSMarketplace \
     --region "${AWS_REGION}" \
     --change-set-name "${CHANGE_SET_NAME}" \
-    --change-set "${CHANGE_SET}" \
+    --change-set "file://${CHANGE_SET_FILE}" \
     ${intent[@]+"${intent[@]}"} \
     --query ChangeSetId --output text
 }

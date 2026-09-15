@@ -17,7 +17,12 @@ AmiProduct detail shape is not something we want to hard-code and silently break
 on. Anything it cannot determine comes back as a reason string, never a default -
 a change set aimed at the wrong version is worse than one that refuses to build.
 
-Usage: describe-entity.py '<describe-entity json>' [<ami-id>]
+Takes a PATH rather than the JSON itself: the response outgrew the 128 KB Linux
+caps on a single argv entry once the listing carried three versions, each with a
+long AvailableInstanceTypes list, and execve failed with "Argument list too long".
+It only grows from here.
+
+Usage: describe-entity.py <path-to-describe-entity.json> [<ami-id>]
 """
 import json
 import sys
@@ -147,7 +152,8 @@ def outline(node, depth=0, max_depth=4):
 
 
 def main():
-    entity = json.loads(sys.argv[1])
+    with open(sys.argv[1]) as fh:
+        entity = json.load(fh)
     ami_id = sys.argv[2] if len(sys.argv) > 2 else ""
 
     doc = _details(entity)
