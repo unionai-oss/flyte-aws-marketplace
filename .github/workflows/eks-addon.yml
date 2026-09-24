@@ -41,6 +41,9 @@ jobs:
     outputs:
       bumped: ${{ steps.check.outputs.bumped }}
       addon: ${{ steps.check.outputs.addon }}
+      # The branch the bump landed on, so submit can check out the version it is
+      # actually shipping rather than whatever main happens to hold.
+      branch: ${{ steps.pr.outputs.branch }}
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
@@ -94,11 +97,13 @@ jobs:
         run: eks/scripts/build-addon.sh
 
       - name: open the bump PR
+        id: pr
         if: steps.check.outputs.bumped == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           BRANCH="bump/flyte-${{ steps.check.outputs.flyte }}-addon-${{ steps.check.outputs.addon }}"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
@@ -114,15 +119,38 @@ jobs:
   submit:
     name: submit version to AWS Marketplace
     needs: release
-    if: inputs.submit && needs.release.outputs.bumped == 'true'
+    # Deliberately NOT gated on bumped. The version waiting to be published is
+    # usually one a PREVIOUS run bumped and nobody submitted - that is exactly
+    # the state the add-on sat in, with 0.1.3 pinned in the repo and only 0.1.2
+    # live. Requiring a fresh upstream release to submit meant the only way to
+    # ship a pinned version was to wait for upstream to move again.
+    if: inputs.submit
     runs-on: ubuntu-latest
     # Gate this behind a GitHub Environment with required reviewers: the change
     # request cannot be withdrawn, and a rejection costs a chart version.
     environment: marketplace-publish
     steps:
+      # Check out the bump branch when this run created one. The default
+      # checkout takes main, which still holds the PREVIOUS version - so a run
+      # that bumped to 0.1.4, pushed 0.1.4 artifacts to ECR and then submitted
+      # would have submitted 0.1.3 against 0.1.4's artifacts. Empty ref means
+      # the triggering ref, which is right when nothing was bumped.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.branch }}
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
+          # Marketplace validation is slow; the devbox product saw 27 minutes.
+          # Needs MaxSessionDuration raised on the role to match.
+          role-duration-seconds: 14400
+      - name: what is being submitted
+        run: |
+          source eks/versions.env
+          echo "add-on ${ADDON_VERSION} (flyte-binary ${FLYTE_CHART_VERSION}) from $(git rev-parse --short HEAD)"
+      # Idempotent - it skips tags already present and refuses to overwrite one
+      # holding different content. Run it here too so a submit of a version this
+      # run did NOT bump still has its artifacts in the Marketplace ECR.
+      - run: eks/scripts/build-addon.sh
       - run: eks/scripts/submit-version.sh
