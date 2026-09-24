@@ -33,19 +33,34 @@ INSTALL_MODE="${INSTALL_MODE:-auto}"
 
 SA_NAME="flyte-backend"   # must match wrapper values.yaml + PodIdentityAssociation
 
-addon_version_is_published() {
-  # Returns 0 if ADDON_VERSION for ADDON_PRODUCT_NAME is offered by the catalog
-  # for the cluster's Kubernetes version in this region.
+# Resolve the CONCRETE catalog version string for the pinned ADDON_VERSION, or
+# print nothing if it is not published for this Kubernetes version.
+#
+# AWS appends its own build suffix when it ingests a seller's add-on: v0.1.2
+# ships as "v0.1.2-eksbuild.1". This used to compare for exact equality against
+# ADDON_VERSION, which therefore never matched anything AWS had actually
+# published - the resolver reported "not published" for a live add-on and fell
+# through to helm every time, silently. Matching a live catalog entry is the
+# whole trigger for the add-on path, so that bug meant the path could not fire
+# at all.
+#
+# create-addon needs the full suffixed string too, so resolve it rather than
+# assume it: the suffix is AWS's and can be -eksbuild.2 on a rebuild.
+resolve_published_addon_version() {
   aws eks describe-addon-versions \
     --region "${AWS_REGION}" \
     --addon-name "${ADDON_PRODUCT_NAME}" \
     --kubernetes-version "${EKS_K8S_VERSION}" \
-    --query "addons[].addonVersions[?addonVersion=='${ADDON_VERSION}'] | [] | [0].addonVersion" \
-    --output text 2>/dev/null | grep -qx "${ADDON_VERSION}"
+    --query "addons[].addonVersions[?addonVersion=='${ADDON_VERSION}' || starts_with(addonVersion, '${ADDON_VERSION}-eksbuild')].addonVersion | [] | sort(@) | [-1]" \
+    --output text 2>/dev/null | grep -v '^None$' || true
 }
 
 install_via_addon() {
-  echo ">> Installing Flyte via EKS add-on ${ADDON_PRODUCT_NAME} ${ADDON_VERSION}"
+  # Falls back to the pinned string when called directly with INSTALL_MODE=addon,
+  # so an explicit request still reaches AWS and fails with AWS's own error
+  # rather than being quietly reinterpreted here.
+  local version="${RESOLVED_ADDON_VERSION:-${ADDON_VERSION}}"
+  echo ">> Installing Flyte via EKS add-on ${ADDON_PRODUCT_NAME} ${version}"
   local pod_id_args=()
   if [[ -n "${POD_IDENTITY_ROLE_ARN:-}" ]]; then
     pod_id_args=(--pod-identity-associations \
@@ -55,7 +70,7 @@ install_via_addon() {
     --region "${AWS_REGION}" \
     --cluster-name "${CLUSTER_NAME}" \
     --addon-name "${ADDON_PRODUCT_NAME}" \
-    --addon-version "${ADDON_VERSION}" \
+    --addon-version "${version}" \
     --resolve-conflicts OVERWRITE \
     --configuration-values "file://${CONFIG_FILE}" \
     "${pod_id_args[@]}"
@@ -105,11 +120,18 @@ case "${INSTALL_MODE}" in
   addon) install_via_addon ;;
   helm)  install_via_helm ;;
   auto)
-    if addon_version_is_published; then
-      echo ">> Resolver: add-on ${ADDON_VERSION} is published -> add-on path"
+    RESOLVED_ADDON_VERSION="$(resolve_published_addon_version)"
+    if [[ -n "${RESOLVED_ADDON_VERSION}" ]]; then
+      echo ">> Resolver: ${ADDON_VERSION} is published as ${RESOLVED_ADDON_VERSION} -> add-on path"
       install_via_addon
     else
-      echo ">> Resolver: add-on ${ADDON_VERSION} NOT published -> helm fallback"
+      echo ">> Resolver: ${ADDON_VERSION} is NOT in the ${ADDON_PRODUCT_NAME} catalog"
+      echo "   for Kubernetes ${EKS_K8S_VERSION} in ${AWS_REGION} -> helm fallback."
+      echo "   Published versions AWS does offer:"
+      aws eks describe-addon-versions --region "${AWS_REGION}" \
+        --addon-name "${ADDON_PRODUCT_NAME}" --kubernetes-version "${EKS_K8S_VERSION}" \
+        --query 'addons[].addonVersions[].addonVersion' --output text 2>/dev/null \
+        | tr '\t' '\n' | sed 's/^/     /' || echo "     (none)"
       install_via_helm
     fi
     ;;
