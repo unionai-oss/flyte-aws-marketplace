@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Shared AWS Marketplace Catalog API helpers.
 #
-# Sourced, never executed. Both scripts that talk to the Catalog API need the
+# Sourced, never executed. Every script that talks to the Catalog API needs the
 # same two things - refuse to start while another change set is processing, and
-# wait for the one we submitted to reach a terminal state - and two copies would
-# drift.
+# wait for the one we submitted to reach a terminal state - and copies would
+# drift. Lives at the monorepo root because both products need it.
 #
 # Expects AWS_REGION to be set by the caller.
 

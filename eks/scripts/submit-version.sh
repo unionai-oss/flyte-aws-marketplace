@@ -15,6 +15,9 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/versions.env"
+# Shared with the devbox product; REPO_ROOT here is eks/, so go up one.
+# shellcheck source=../../scripts/lib-catalog.sh
+source "${REPO_ROOT}/../scripts/lib-catalog.sh"
 META="${REPO_ROOT}/addon/metadata.yaml"
 LISTING="${REPO_ROOT}/addon/listing"
 : "${MARKETPLACE_PRODUCT_ID:?MARKETPLACE_PRODUCT_ID is required (set in versions.env)}"
@@ -26,17 +29,7 @@ need aws; need python3
 # Only one EKS add-on delivery option is allowed per version, and Marketplace
 # refuses a new version while the previous one is still working its way to the
 # EKS console. Catch that here rather than burning a chart tag on a rejection.
-echo ">> checking for in-flight change sets on ${MARKETPLACE_PRODUCT_ID}"
-INFLIGHT="$(aws marketplace-catalog list-change-sets --catalog AWSMarketplace \
-  --region "${AWS_REGION}" \
-  --filter-list "Name=EntityId,ValueList=${MARKETPLACE_PRODUCT_ID}" \
-  --query "ChangeSetSummaryList[?Status=='APPLYING' || Status=='PREPARING'].ChangeSetId" \
-  --output text 2>/dev/null || true)"
-if [[ -n "${INFLIGHT}" ]]; then
-  echo "FAIL: a change set is still in flight (${INFLIGHT})." >&2
-  echo "      Wait for it to finish before submitting another version." >&2
-  exit 1
-fi
+refuse_if_change_set_in_flight "${MARKETPLACE_PRODUCT_ID}" || exit 1
 
 PAYLOAD="$(python3 - "${META}" "${LISTING}" "${ADDON_VERSION#v}" "${EKS_K8S_VERSION}" <<'PY'
 import json, re, sys, pathlib
@@ -115,15 +108,33 @@ ID="$(aws marketplace-catalog start-change-set --catalog AWSMarketplace \
   --change-set "${CHANGE_SET}" \
   --query ChangeSetId --output text)"
 
-cat <<EOF
-
->> submitted: ${ID}
-   Watch it with:
-     aws marketplace-catalog describe-change-set --catalog AWSMarketplace \\
-       --change-set-id ${ID} --region ${AWS_REGION} \\
-       --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'
-
-   A rejection burns this chart tag: Marketplace ECR tags are immutable, so the
-   next attempt needs scripts/bump-version.sh --addon <next> and a fresh
-   scripts/build-addon.sh. See MARKETPLACE.md.
-EOF
+# Wait for it. Returning as soon as AWS accepts the request made a green job
+# mean "submitted", not "published" - which is the opposite of what anyone reads
+# it as, and here the difference costs a chart tag.
+echo ">> submitted: ${ID} — waiting for AWS to finish with it"
+rc=0; wait_for_change_set "${ID}" "${APPLY_TIMEOUT:-3600}" "submission" || rc=$?
+case "${rc}" in
+  0) summary "### EKS add-on ${ADDON_VERSION} published (\`${ID}\`)"
+     echo ">> DONE. Add-on ${ADDON_VERSION} is published."
+     echo "   It appears in the catalog as ${ADDON_VERSION}-eksbuild.N; resolve-install.sh"
+     echo "   matches that suffix and will now take the add-on path."
+     ;;
+  2) summary "### EKS add-on ${ADDON_VERSION} still processing (\`${ID}\`)"
+     echo ">> Submitted and still processing after the wait. It is in AWS's hands:"
+     echo "     aws marketplace-catalog describe-change-set --catalog AWSMarketplace \\"
+     echo "       --change-set-id ${ID} --region ${AWS_REGION} \\"
+     echo "       --query '{status:Status,errors:ChangeSet[].ErrorDetailList}'"
+     ;;
+  3) summary "### EKS add-on ${ADDON_VERSION} SUBMITTED, outcome unknown (\`${ID}\`)"
+     echo ">> SUBMITTED as ${ID}, but this job lost the ability to watch it." >&2
+     echo "   Do NOT assume it failed and do NOT resubmit until you have checked it." >&2
+     exit 1
+     ;;
+  *) summary "### EKS add-on ${ADDON_VERSION} REJECTED (\`${ID}\`)"
+     echo "FAIL: the submission was rejected; errors above." >&2
+     echo "      This burns chart tag ${ADDON_VERSION#v}: Marketplace ECR tags are" >&2
+     echo "      immutable, so the next attempt needs scripts/bump-version.sh --addon" >&2
+     echo "      <next> and a fresh scripts/build-addon.sh. See MARKETPLACE.md." >&2
+     exit 1
+     ;;
+esac

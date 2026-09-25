@@ -47,8 +47,9 @@
 set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${REPO_ROOT}/versions.env"
-# shellcheck source=scripts/lib-catalog.sh
-source "${REPO_ROOT}/scripts/lib-catalog.sh"
+# Shared with the eks product; REPO_ROOT here is devbox/, so go up one.
+# shellcheck source=../../scripts/lib-catalog.sh
+source "${REPO_ROOT}/../scripts/lib-catalog.sh"
 LISTING="${REPO_ROOT}/listing"
 MANIFEST="${REPO_ROOT}/.package-manifest.json"
 AWS_REGION="${AWS_REGION:-us-east-1}"

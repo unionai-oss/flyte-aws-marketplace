@@ -76,6 +76,15 @@ gating — build, smoke and publish must all have succeeded — rather than the
 Both products support `validate_only`, which submits under `Intent=VALIDATE` and
 creates nothing; use it as a rehearsal before spending a version title.
 
+Both also **wait for the change set to reach a terminal state** before the job
+exits, using `scripts/lib-catalog.sh`. Returning as soon as AWS accepts the
+request made a green job mean "submitted", not "published" — which is the
+opposite of how anyone reads it, and on the EKS side the difference costs a
+chart tag. The exit status now distinguishes published, rejected, still
+running at the timeout, and *we lost the ability to look* — that last one
+exists because reporting a polling failure as a rejection once told a flat lie
+about a submission that had actually succeeded.
+
 ## Why two roles
 
 The smoke test deploys a whole devbox stack — EC2, Aurora, ALB, Cognito, IAM —
