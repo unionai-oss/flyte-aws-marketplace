@@ -71,7 +71,7 @@ RENDERED="$(helm template flyte "${CHART_DIR}" \
   --namespace "${ADDON_NAMESPACE}" \
   --include-crds --no-hooks \
   -f "${CONFIG}")"
-echo "${RENDERED}" | head -1 >/dev/null
+[ -n "${RENDERED}" ] || fail "helm template produced nothing"
 
 # Marketplace validates a submitted chart by templating it with DEFAULT VALUES
 # ONLY. Any `required` guard left unsatisfied by values.yaml fails ingestion with
@@ -102,38 +102,38 @@ echo "== 5. rendered manifests reflect external config =="
 # flyte-binary renamed/renested a value path in an upgrade, these assertions
 # catch it before we ship. (v2 nests the live DB config under database.postgres;
 # a regression to the flat path would leave the default 127.0.0.1 in place.)
-echo "${RENDERED}" | grep -q "flyte-example-bucket" \
+grep -q "flyte-example-bucket" <<<"${RENDERED}" \
   || fail "S3 bucket not present in rendered config (storage value-path drift?)"
-echo "${RENDERED}" | grep -q "cluster-abcdef.us-east-1.rds.amazonaws.com" \
+grep -q "cluster-abcdef.us-east-1.rds.amazonaws.com" <<<"${RENDERED}" \
   || fail "DB host not present in rendered config (database value-path drift?)"
 
 # Extract the effective database config block and assert the Aurora host WON the
 # merge over the chart's localhost default. This is the check that catches the
 # v1-flat-vs-v2-postgres value-path trap.
 DBBLOCK="$(echo "${RENDERED}" | awk '/002-database.yaml: \|/{f=1} f{print} /003-storage.yaml/{f=0}')"
-echo "${DBBLOCK}" | grep -q "host: flyte.cluster-abcdef.us-east-1.rds.amazonaws.com" \
+grep -q "host: flyte.cluster-abcdef.us-east-1.rds.amazonaws.com" <<<"${DBBLOCK}" \
   || fail "Aurora host did not land in the effective postgres block (v1/v2 path drift)"
-echo "${DBBLOCK}" | grep -q "host: 127.0.0.1" \
+grep -q "host: 127.0.0.1" <<<"${DBBLOCK}" \
   && fail "database still points at 127.0.0.1 — configuration.database.postgres.host was not applied" || true
 
 # S3 auth must be IAM (Pod Identity), never static keys.
-echo "${RENDERED}" | grep -q "auth_type: iam" \
+grep -q "auth_type: iam" <<<"${RENDERED}" \
   || fail "S3 auth_type is not iam in rendered storage config"
-echo "${RENDERED}" | grep -qiE "access_key|secret_key|accessKey|secretKey" \
+grep -qiE "access_key|secret_key|accessKey|secretKey" <<<"${RENDERED}" \
   && fail "static S3 credentials appear in rendered config — must use Pod Identity (iam)" || true
 
 # The DB password must never appear inline in rendered manifests.
-echo "${RENDERED}" | grep -qiE "^\s*password: .+[A-Za-z0-9]" \
+grep -qiE "^\s*password: .+[A-Za-z0-9]" <<<"${RENDERED}" \
   && fail "an inline password appears in rendered manifests — must use passwordPath" || true
 
 # The alias in Chart.yaml renames .Chart.Name inside the subchart; nameOverride
 # has to pin the rendered names back or every consumer of flyte-flyte-binary-http
 # breaks (smoke-test.sh, cloudformation/root.yaml, render-config.sh).
-echo "${RENDERED}" | grep -q "name: flyte-flyte-binary-http" \
+grep -q "name: flyte-flyte-binary-http" <<<"${RENDERED}" \
   || fail "flyte-flyte-binary-http not rendered — flyteBinary.nameOverride lost?"
 # Only top-level metadata.name (2-space indent); CRD printer columns and env var
 # names legitimately contain uppercase.
-echo "${RENDERED}" | grep -qE "^  name: .*[A-Z]" \
+grep -qE "^  name: .*[A-Z]" <<<"${RENDERED}" \
   && fail "a rendered resource name contains uppercase (invalid DNS-1123)" || true
 
 echo "== 6. Marketplace EKS add-on packaging rules =="
@@ -286,7 +286,7 @@ grep -E '^\s+repository:' "${CHART_DIR}/Chart.yaml" | grep -qv 'file://' \
   || fail "dependency not vendored at charts/${FLYTE_CHART_NAME}/"
 
 # 6g. The framework tracks add-on rollout through a Deployment or DaemonSet.
-echo "${RENDERED}" | grep -qE '^kind: (Deployment|DaemonSet)$' \
+grep -qE '^kind: (Deployment|DaemonSet)$' <<<"${RENDERED}" \
   || fail "no Deployment or DaemonSet rendered — the add-on would be untrackable"
 
 echo "ALL CHECKS PASSED"
