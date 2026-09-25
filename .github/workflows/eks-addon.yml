@@ -149,8 +149,34 @@ jobs:
         run: |
           source eks/versions.env
           echo "add-on ${ADDON_VERSION} (flyte-binary ${FLYTE_CHART_VERSION}) from $(git rev-parse --short HEAD)"
-      # Idempotent - it skips tags already present and refuses to overwrite one
-      # holding different content. Run it here too so a submit of a version this
-      # run did NOT bump still has its artifacts in the Marketplace ECR.
-      - run: eks/scripts/build-addon.sh
+      # VERIFY the artifacts, do not build them. Submitting a version whose
+      # chart or images are missing from the Marketplace ECR fails ingestion,
+      # so this has to be checked - but building here needed helm and crane that
+      # only the release job installs, and it failed with "crane not found on
+      # PATH". Building during a submit was the wrong shape anyway: if the
+      # artifacts are absent the fix is to run the release path, not to quietly
+      # produce them from whatever is checked out.
+      - name: verify the artifacts are in the Marketplace ECR
+        run: |
+          source eks/versions.env
+          REG="${MARKETPLACE_REGISTRY%%.*}"
+          missing=0
+          check() {
+            if aws ecr describe-images --registry-id "$REG" \
+                 --repository-name "$MARKETPLACE_REPO" \
+                 --image-ids "imageTag=$1" --region "$AWS_REGION" >/dev/null 2>&1; then
+              echo "  ok      $1"
+            else
+              echo "  MISSING $1"; missing=1
+            fi
+          }
+          echo "chart:"
+          check "${ADDON_VERSION#v}"
+          echo "images:"
+          for row in "${MP_IMAGES[@]}"; do check "${row##*|}"; done
+          if [ "$missing" != 0 ]; then
+            echo "Artifacts are missing from ${MARKETPLACE_ECR}." >&2
+            echo "Run the release path (eks/scripts/build-addon.sh) before submitting." >&2
+            exit 1
+          fi
       - run: eks/scripts/submit-version.sh
