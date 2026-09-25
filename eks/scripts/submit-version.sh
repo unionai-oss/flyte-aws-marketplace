@@ -95,7 +95,10 @@ print(json.dumps([{
     "ChangeType": "AddDeliveryOptions",
     "Entity": {"Type": "ContainerProduct@1.0", "Identifier": product_id},
     "DetailsDocument": json.loads(details),
-    "ChangeName": "AddEksAddOnVersion" + version.replace(".", ""),
+    # Letters only: AWS enforces ^[a-zA-Z]{1,72}$ on ChangeName, so appending the
+    # version ("AddEksAddOnVersion015") is rejected outright. The version belongs
+    # in --change-set-name, which has no such restriction and already carries it.
+    "ChangeName": "AddEksAddOnVersion",
 }]))' "${PAYLOAD}" "${MARKETPLACE_PRODUCT_ID}" "${ADDON_VERSION#v}")"
 
 echo ">> change set for ${MARKETPLACE_PRODUCT_ID}, add-on version ${ADDON_VERSION#v}:"
