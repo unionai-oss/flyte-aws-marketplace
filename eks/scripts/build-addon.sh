@@ -105,10 +105,32 @@ else
 fi
 
 echo ">> [4/4] package + push wrapper chart as OCI artifact"
-mkdir -p "${REPO_ROOT}/dist"
-rm -f "${REPO_ROOT}/dist/flyte-eks-add-on-"*.tgz
-helm package "${CHART_DIR}" --destination "${REPO_ROOT}/dist"
-helm push "${REPO_ROOT}/dist/flyte-eks-add-on-${ADDON_VERSION#v}.tgz" "${CHART_PUSH_TARGET}"
+# Skip when the tag is already there. Marketplace ECR tags are IMMUTABLE, so a
+# re-push is not a no-op - it is a hard failure:
+#
+#   tag invalid: The image tag '0.1.5' already exists in the
+#   'union-ai/flyte-eks-add-on' repository and cannot be overwritten
+#
+# The image relocation above already skips existing tags; the chart push did not,
+# so re-running for any reason other than a fresh bump - submitting a version a
+# previous run built, say - failed here rather than being the no-op it reads as.
+#
+# Note what this does NOT do: verify the pushed chart matches the local one. It
+# cannot be corrected if it does not, because the tag is immutable. A changed
+# chart needs a new ADDON_VERSION (scripts/bump-version.sh), not a re-push.
+CHART_TAG="${ADDON_VERSION#v}"
+if aws ecr describe-images \
+     --registry-id "${MARKETPLACE_REGISTRY%%.*}" \
+     --repository-name "${MARKETPLACE_REPO}" \
+     --image-ids "imageTag=${CHART_TAG}" \
+     --region "${AWS_REGION}" >/dev/null 2>&1; then
+  echo "   chart ${CHART_TAG} already in ${MARKETPLACE_ECR}; skipping push (tags are immutable)"
+else
+  mkdir -p "${REPO_ROOT}/dist"
+  rm -f "${REPO_ROOT}/dist/flyte-eks-add-on-"*.tgz
+  helm package "${CHART_DIR}" --destination "${REPO_ROOT}/dist"
+  helm push "${REPO_ROOT}/dist/flyte-eks-add-on-${CHART_TAG}.tgz" "${CHART_PUSH_TARGET}"
+fi
 
 cat <<EOF
 
