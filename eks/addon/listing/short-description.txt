@@ -1,0 +1,1 @@
+Flyte 2 is an open-source orchestrator for machine learning and data workflows. This add-on installs the Flyte control plane into your Amazon EKS cluster, and no software charge applies.
