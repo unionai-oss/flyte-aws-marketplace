@@ -9,10 +9,10 @@ description: >-
 type: application
 
 # Wrapper chart version. Keep in lockstep with ADDON_VERSION in versions.env.
-version: 0.1.5
+version: 0.1.6
 
 # The Flyte backend version this add-on delivers (flyte-binary appVersion).
-appVersion: "2.0.50"
+appVersion: "2.0.52"
 
 dependencies:
   # Pinned to FLYTE_CHART_VERSION in versions.env. Vendored into charts/ as an
@@ -29,5 +29,5 @@ dependencies:
   # pin every rendered name back to what it was.
   - name: flyte-binary
     alias: flyteBinary
-    version: v2.0.50
+    version: v2.0.52
     repository: "file://charts/flyte-binary"
